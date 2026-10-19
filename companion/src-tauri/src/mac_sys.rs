@@ -47,7 +47,7 @@ use core_graphics::window::{
     kCGWindowListOptionAll, kCGWindowListOptionOnScreenOnly, kCGWindowOwnerPID,
 };
 
-use crate::keymap::{self, DictationMenuItem, KeyStroke, MacKey};
+use crate::keymap::{self, DictationMenuItem, KeyStroke};
 
 // ───────────────────────────── Raw FFI ─────────────────────────────
 
@@ -456,18 +456,7 @@ fn plan_stroke(src: &CGEventSource, keycode: u16, stroke: &KeyStroke, out: &mut 
 pub fn post_strokes(strokes: &[KeyStroke]) -> Result<(), String> {
     require_permission()?;
     // 1. Resolve every Char key BEFORE building anything; one miss = nothing posted.
-    let mut codes = Vec::with_capacity(strokes.len());
-    for s in strokes {
-        let code = match s.key {
-            MacKey::Code(k) => k,
-            MacKey::Char(c) => keycode_for_char(c, s.mods.cmd).ok_or_else(|| {
-                format!(
-                    "keyboard layout key '{c}' not resolved yet — nothing injected (open the Companion window once)"
-                )
-            })?,
-        };
-        codes.push(code);
-    }
+    let codes = keymap::resolve_stroke_codes(strokes, keycode_for_char)?;
     // 2. Build every event for the whole sequence (creation is the only fallible step).
     let src = hid_source()?;
     let mut planned = Vec::new();
@@ -688,26 +677,18 @@ fn find_window(needle: &str, exclude_pid: i32, hint_pid: Option<i32>) -> Option<
         return None;
     }
     let deadline = Instant::now() + FIND_WINDOW_BUDGET;
-    if let Some(pid) = hint_pid.filter(|p| *p != exclude_pid) {
-        if let Some(app) = AxElement::application(pid) {
-            if let Some(win) = matching_window(&app, &needle_lower) {
-                return Some((pid, app, win));
-            }
-        }
-    }
-    for pid in candidate_pids(exclude_pid) {
-        if Instant::now() >= deadline {
-            return None; // budget spent: report no match rather than stall the caller
-        }
-        if Some(pid) == hint_pid {
-            continue; // already tried
-        }
-        let Some(app) = AxElement::application(pid) else { continue };
-        if let Some(win) = matching_window(&app, &needle_lower) {
-            return Some((pid, app, win));
-        }
-    }
-    None
+    crate::kirocrew_control::scan_window_pids(
+        hint_pid,
+        exclude_pid,
+        || candidate_pids(exclude_pid),
+        || Instant::now() >= deadline,
+        |pid| {
+            let app = AxElement::application(pid)?;
+            let win = matching_window(&app, &needle_lower)?;
+            Some((app, win))
+        },
+    )
+    .map(|(pid, (app, win))| (pid, app, win))
 }
 
 pub fn find_window_pid_by_title(
@@ -724,13 +705,19 @@ fn is_focused_window(app: &AxElement, win: &AxElement) -> bool {
     let Some(focused) = app.element_attr("AXFocusedWindow") else {
         return false;
     };
-    if focused.0 == win.0 {
-        return true;
-    }
-    match (focused.string_attr("AXTitle"), win.string_attr("AXTitle")) {
-        (Some(a), Some(b)) => !b.is_empty() && a == b,
-        _ => false,
-    }
+    let same_element = focused.0 == win.0;
+    // Titles are read only when the elements differ (identical AX traffic to before).
+    let (focused_title, target_title) = if same_element {
+        (None, None)
+    } else {
+        (focused.string_attr("AXTitle"), win.string_attr("AXTitle"))
+    };
+    crate::kirocrew_control::focused_window_matches(
+        true,
+        same_element,
+        focused_title.as_deref(),
+        target_title.as_deref(),
+    )
 }
 
 pub fn focus_window_by_title(
@@ -770,9 +757,11 @@ pub fn focus_window_by_title(
 /// Press a menu-bar item of `pid` (never the frontmost app, never ourselves).
 /// Walks the menu bar's items and their `AXMenu` children one level deep, then
 /// works inside ONE menu only (the one with a primary Start/Stop Dictation
-/// entry, i.e. Edit, else the first menu with any match): picks the first
-/// enabled item that `matcher` classifies as `prefer`, else the first enabled
-/// match of any kind. Returns the kind that was pressed.
+/// entry, i.e. Edit, else the first menu with any match). Within it, picks the
+/// first enabled item that is (1) a primary entry of the `prefer` kind, else
+/// (2) any primary entry, else (3) any item of the `prefer` kind, else (4) the
+/// first match (see `keymap::pick_dictation_menu_item`). Returns the kind that
+/// was pressed.
 pub fn press_menu_item(
     pid: i32,
     matcher: fn(&str) -> Option<DictationMenuItem>,
@@ -808,19 +797,16 @@ pub fn press_menu_item(
             }
         }
     }
-    let home = groups
+    let titles: Vec<Vec<(&str, DictationMenuItem)>> = groups
         .iter()
-        .position(|g| g.iter().any(|(_, t, _)| crate::pc_asr::dictation_menu_is_primary(t)))
-        .or(if groups.is_empty() { None } else { Some(0) });
-    let Some(home) = home else {
+        .map(|g| g.iter().map(|(_, t, k)| (t.as_str(), *k)).collect())
+        .collect();
+    let Some((g, i)) =
+        keymap::pick_dictation_menu_item(&titles, prefer, crate::pc_asr::dictation_menu_is_primary)
+    else {
         return Err("no matching dictation menu item found in the target app's menu bar".to_string());
     };
-    let group = groups.swap_remove(home);
-    let pick = group
-        .iter()
-        .position(|(_, _, k)| *k == prefer)
-        .unwrap_or(0);
-    let (item, title, kind) = &group[pick];
+    let (item, title, kind) = &groups[g][i];
     if item.perform("AXPress") {
         Ok(*kind)
     } else {

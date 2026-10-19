@@ -996,6 +996,61 @@ pub fn candidate_needles(title_match: &str) -> Vec<String> {
     }
 }
 
+/// Find-window scan order and budget rule (pure core of `mac_sys::find_window`).
+/// The hint is tried first (if != `exclude_pid`; NOT subject to the budget). Only
+/// on a hint miss is `candidates()` called, once, and walked in order: before
+/// each pid, `budget_spent()` → return `None`; skip `pid == hint_pid` and
+/// `pid == exclude_pid`; the first `probe(pid)` that returns `Some(t)` wins.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn scan_window_pids<T>(
+    hint_pid: Option<i32>,
+    exclude_pid: i32,
+    candidates: impl FnOnce() -> Vec<i32>,
+    mut budget_spent: impl FnMut() -> bool,
+    mut probe: impl FnMut(i32) -> Option<T>,
+) -> Option<(i32, T)> {
+    if let Some(pid) = hint_pid.filter(|p| *p != exclude_pid) {
+        if let Some(t) = probe(pid) {
+            return Some((pid, t));
+        }
+    }
+    for pid in candidates() {
+        if budget_spent() {
+            return None; // budget spent: report no match rather than stall the caller
+        }
+        if Some(pid) == hint_pid || pid == exclude_pid {
+            continue; // already tried / ours
+        }
+        if let Some(t) = probe(pid) {
+            return Some((pid, t));
+        }
+    }
+    None
+}
+
+/// Pure core of `mac_sys::is_focused_window`. No focused window → false (fail
+/// closed). Same AX element → true. Otherwise true only when both titles are
+/// present, equal, and the target title is non-empty. (Two same-titled windows
+/// of one app count as focused: pre-existing, accepted in the build reviews.)
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn focused_window_matches(
+    focused_present: bool,
+    same_element: bool,
+    focused_title: Option<&str>,
+    target_title: Option<&str>,
+) -> bool {
+    if !focused_present {
+        return false;
+    }
+    if same_element {
+        return true;
+    }
+    match (focused_title, target_title) {
+        (Some(a), Some(b)) => !b.is_empty() && a == b,
+        _ => false,
+    }
+}
+
 /// The FP-4b controller: focus a local Kiro Crew window and inject text / the
 /// command bar / chords. Windows-backed for real; a compiling no-op/Err stub
 /// elsewhere. Construct with [`KiroCrewController::new`].
@@ -1452,5 +1507,118 @@ mod tests {
         assert_eq!(c.target_pid(), None);
         let _ = c.focus();
         assert_eq!(c.target_pid(), None);
+    }
+
+    // ── scan_window_pids / focused_window_matches (pure cores of mac_sys) ──
+
+    use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn scan_hint_hit_skips_enumeration_and_budget() {
+        let got = scan_window_pids(
+            Some(7),
+            1,
+            || panic!("candidates must not be enumerated on a hint hit"),
+            || true,
+            |pid| (pid == 7).then_some("win"),
+        );
+        assert_eq!(got, Some((7, "win")));
+    }
+
+    #[test]
+    fn scan_hint_equal_to_exclude_is_never_probed() {
+        let log = RefCell::new(Vec::new());
+        let got = scan_window_pids(
+            Some(5),
+            5,
+            || vec![5, 6],
+            || false,
+            |pid| {
+                log.borrow_mut().push(pid);
+                Some(())
+            },
+        );
+        assert_eq!(got, Some((6, ())));
+        assert_eq!(*log.borrow(), vec![6]);
+    }
+
+    #[test]
+    fn scan_does_not_reprobe_hint() {
+        let log = RefCell::new(Vec::new());
+        let got = scan_window_pids(
+            Some(3),
+            1,
+            || vec![3, 4],
+            || false,
+            |pid| {
+                log.borrow_mut().push(pid);
+                (pid == 4).then_some(())
+            },
+        );
+        assert_eq!(got, Some((4, ())));
+        assert_eq!(*log.borrow(), vec![3, 4]);
+    }
+
+    #[test]
+    fn scan_returns_first_match_in_candidate_order() {
+        let got = scan_window_pids(
+            None,
+            0,
+            || vec![1, 2, 3],
+            || false,
+            |pid| (pid >= 2).then_some(pid * 10),
+        );
+        assert_eq!(got, Some((2, 20)));
+    }
+
+    #[test]
+    fn scan_stops_when_budget_spent() {
+        let calls = Cell::new(0);
+        let log = RefCell::new(Vec::new());
+        let got = scan_window_pids(
+            None,
+            0,
+            || vec![1, 2, 3],
+            || {
+                calls.set(calls.get() + 1);
+                calls.get() >= 3
+            },
+            |pid| {
+                log.borrow_mut().push(pid);
+                (pid == 3).then_some(())
+            },
+        );
+        assert_eq!(got, None);
+        assert_eq!(*log.borrow(), vec![1, 2]);
+    }
+
+    #[test]
+    fn scan_budget_spent_before_first_candidate() {
+        let got = scan_window_pids::<()>(
+            None,
+            0,
+            || vec![1, 2],
+            || true,
+            |pid| panic!("probe({pid}) called after budget spent"),
+        );
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn focused_window_matches_rules() {
+        let k = Some("Kiro Crew");
+        // No focused window fails closed even if the titles would match.
+        assert!(!focused_window_matches(false, true, k, k));
+        // Same AX element.
+        assert!(focused_window_matches(true, true, None, None));
+        // Different elements, same non-empty title: current accepted behaviour.
+        assert!(focused_window_matches(true, false, k, k));
+        // Empty titles never match.
+        assert!(!focused_window_matches(true, false, Some(""), Some("")));
+        // A missing title on either side never matches.
+        assert!(!focused_window_matches(true, false, Some("x"), None));
+        assert!(!focused_window_matches(true, false, None, Some("x")));
+        // Different windows of the app.
+        assert!(!focused_window_matches(true, false, k, Some("Gmail")));
     }
 }
