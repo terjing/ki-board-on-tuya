@@ -8,8 +8,10 @@
 //!   Kiro Crew window by a configurable title substring, brings it to the
 //!   foreground, and injects text / the Ctrl+K command bar / named chords. It
 //!   reuses the raw `SendInput` pattern from [`crate::inject`] (no new crate).
-//!   On non-Windows hosts a stub compiles and returns `Err` / no-ops so the
-//!   Linux CI build and the pure router tests below still work.
+//!   On macOS the backend focuses the window through the Accessibility API and
+//!   injects CGEvents (`mac_sys`); the command bar is ⌘K. On other hosts a
+//!   stub compiles and returns `Err` / no-ops so the Linux CI build and the
+//!   pure router tests below still work.
 //!
 //! * [`ControlRouter`] / [`route_input`] — a **pure**, IO-free mapping from a
 //!   decoded board [`Inbound`] event to a [`ControlAction`]. Table-driven and
@@ -37,7 +39,7 @@ pub enum Chord {
     DeleteWord,
     /// Ctrl+A, Backspace — clear the current composer sentence.
     ClearInput,
-    /// Ctrl+K — open the Kiro Crew command bar.
+    /// Ctrl+K (⌘K on macOS) — open the Kiro Crew command bar.
     CtrlK,
     /// Alt+N — jump to chat N (N = 1..=9). Deterministic, unlike a command-bar
     /// text search. (Kiro Crew default shortcut "Jump to chat N".)
@@ -92,7 +94,7 @@ impl Chord {
 /// (Windows) [`KiroCrewController`]; pure and IO-free so it is fully testable.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControlAction {
-    /// Open the command bar (Ctrl+K), type the string, press Enter.
+    /// Open the command bar (Ctrl+K / ⌘K), type the string, press Enter.
     CommandBar(String),
     /// Inject a single named chord.
     Chord(Chord),
@@ -748,9 +750,183 @@ mod windows_impl {
     }
 }
 
-// ============================ Non-Windows ============================
+// =============================== macOS ===============================
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod macos_impl {
+    use super::{candidate_needles, Chord, DEFAULT_TITLE_CANDIDATES};
+    use crate::keymap::{self, mac_keycode};
+    use crate::mac_sys;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
+
+    const DELETE_REPEAT_INITIAL_DELAY: Duration = Duration::from_millis(280);
+    const DELETE_REPEAT_INTERVAL: Duration = Duration::from_millis(120);
+    const DELETE_REPEAT_MAX_DURATION: Duration = Duration::from_secs(10);
+
+    struct DeleteRepeat {
+        stop: Arc<AtomicBool>,
+        worker: JoinHandle<()>,
+    }
+
+    /// macOS controller: focuses a Kiro Crew window (AX) then injects (CGEvent).
+    /// Caches only the PID, never AX handles, so it stays `Send`.
+    pub struct MacController {
+        pid: Option<i32>,
+        title_match: String,
+        delete_repeat: Option<DeleteRepeat>,
+    }
+
+    fn require_permission() -> Result<(), String> {
+        if mac_sys::input_permission_granted() {
+            Ok(())
+        } else {
+            Err("Accessibility permission not granted — enable it in System Settings → \
+                 Privacy & Security → Accessibility (nothing injected)"
+                .to_string())
+        }
+    }
+
+    fn post_chord(c: Chord) -> Result<(), String> {
+        mac_sys::post_strokes(&keymap::mac_chord_strokes(c)?)
+    }
+
+    impl MacController {
+        pub fn new(title_match: Option<String>) -> Self {
+            Self {
+                pid: None,
+                title_match: title_match.unwrap_or_default(),
+                delete_repeat: None,
+            }
+        }
+
+        pub fn set_title_match(&mut self, title: String) {
+            self.title_match = title;
+            self.pid = None; // force re-resolve on next focus
+        }
+
+        /// PID resolved by the last successful `focus()`.
+        pub fn target_pid(&self) -> Option<i32> {
+            self.pid
+        }
+
+        /// Resolve + foreground the Kiro Crew window. Checks the Accessibility
+        /// grant FIRST so the user never sees a misleading "no window matches".
+        /// Verifies a match BEFORE any injection; on a miss the cached PID is
+        /// cleared and `Err` returned.
+        pub fn focus(&mut self) -> Result<(), String> {
+            require_permission()?;
+            let own_pid = std::process::id() as i32;
+            let mut focus_err: Option<String> = None;
+            for needle in candidate_needles(&self.title_match) {
+                match mac_sys::focus_window_by_title(&needle, own_pid, self.pid) {
+                    Ok(pid) => {
+                        self.pid = Some(pid);
+                        return Ok(());
+                    }
+                    Err(e) if e.starts_with(mac_sys::ERR_NO_MATCH) => {}
+                    // Window found but could not be raised, etc.: report as-is.
+                    Err(e) => focus_err = focus_err.or(Some(e)),
+                }
+            }
+            self.pid = None;
+            if let Some(e) = focus_err {
+                return Err(format!("control: {e}"));
+            }
+            Err(format!(
+                "control: no window matches title {:?} (nothing injected)",
+                if self.title_match.trim().is_empty() {
+                    DEFAULT_TITLE_CANDIDATES.join(" / ")
+                } else {
+                    self.title_match.clone()
+                }
+            ))
+        }
+
+        pub fn send_text(&mut self, text: &str) -> Result<(), String> {
+            self.focus()?;
+            mac_sys::type_text(text)
+        }
+
+        pub fn command_bar(&mut self, cmd: &str) -> Result<(), String> {
+            self.focus()?;
+            post_chord(Chord::CtrlK)?;
+            mac_sys::type_text(cmd)?;
+            mac_sys::post_key(mac_keycode::RETURN)
+        }
+
+        /// Focus the window, then type — no Enter (K5 submits).
+        pub fn compose(&mut self, text: &str) -> Result<(), String> {
+            self.focus()?;
+            mac_sys::type_text(text)
+        }
+
+        pub fn chord(&mut self, keys: Chord) -> Result<(), String> {
+            self.focus()?;
+            post_chord(keys)
+        }
+
+        pub fn start_delete_words(&mut self) -> Result<(), String> {
+            self.stop_delete_words()?;
+            self.focus()?;
+            let pid = self.pid.ok_or("control: target window unavailable")?;
+            // DeleteWord is all-physical, so the off-main worker needs no layout lookup.
+            let strokes = keymap::mac_chord_strokes(Chord::DeleteWord)?;
+
+            // Delete one word immediately, then repeat after a typematic delay
+            // while the same target stays frontmost.
+            mac_sys::post_strokes(&strokes)?;
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = Arc::clone(&stop);
+            let worker = thread::Builder::new()
+                .name("ak-delete-words".to_string())
+                .spawn(move || {
+                    let started = Instant::now();
+                    thread::sleep(DELETE_REPEAT_INITIAL_DELAY);
+                    while !worker_stop.load(Ordering::Acquire)
+                        && started.elapsed() < DELETE_REPEAT_MAX_DURATION
+                    {
+                        // Never continue injecting if focus moved to another app.
+                        if mac_sys::frontmost_pid() != Some(pid) {
+                            break;
+                        }
+                        if mac_sys::post_strokes(&strokes).is_err() {
+                            break;
+                        }
+                        thread::sleep(DELETE_REPEAT_INTERVAL);
+                    }
+                })
+                .map_err(|error| format!("control: start delete repeat: {error}"))?;
+            self.delete_repeat = Some(DeleteRepeat { stop, worker });
+            Ok(())
+        }
+
+        pub fn stop_delete_words(&mut self) -> Result<(), String> {
+            if let Some(repeat) = self.delete_repeat.take() {
+                repeat.stop.store(true, Ordering::Release);
+                repeat
+                    .worker
+                    .join()
+                    .map_err(|_| "control: delete repeat thread panicked".to_string())?;
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for MacController {
+        fn drop(&mut self) {
+            let _ = self.stop_delete_words();
+        }
+    }
+}
+
+// ============================ Other hosts ============================
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod stub_impl {
     use super::Chord;
 
@@ -805,14 +981,19 @@ mod stub_impl {
 
 #[cfg(windows)]
 type Backend = windows_impl::WinController;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+type Backend = macos_impl::MacController;
+#[cfg(not(any(windows, target_os = "macos")))]
 type Backend = stub_impl::StubController;
 
-/// Window-title needles to try, in order, for a configured title match (U1
-/// scaffold; U2 implements).
+/// Window-title needles to try, in order, for a configured title match: the
+/// configured substring alone, else [`DEFAULT_TITLE_CANDIDATES`].
 pub fn candidate_needles(title_match: &str) -> Vec<String> {
-    let _ = title_match;
-    todo!("U2")
+    if title_match.trim().is_empty() {
+        DEFAULT_TITLE_CANDIDATES.iter().map(|s| s.to_string()).collect()
+    } else {
+        vec![title_match.to_string()]
+    }
 }
 
 /// The FP-4b controller: focus a local Kiro Crew window and inject text / the
@@ -830,9 +1011,16 @@ impl KiroCrewController {
     }
 
     /// PID of the window the last successful `focus()` resolved (macOS); `None`
-    /// elsewhere. U1 scaffold; U2 wires the macOS backend.
+    /// elsewhere.
     pub fn target_pid(&self) -> Option<i32> {
-        None
+        #[cfg(target_os = "macos")]
+        {
+            self.backend.target_pid()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
     }
 
     /// Re-configure the title substring to match (clears any cached handle).
@@ -851,7 +1039,7 @@ impl KiroCrewController {
         self.backend.send_text(text)
     }
 
-    /// Focus, open the command bar (Ctrl+K), type `cmd`, press Enter.
+    /// Focus, open the command bar (Ctrl+K / ⌘K), type `cmd`, press Enter.
     pub fn command_bar(&mut self, cmd: &str) -> Result<(), String> {
         self.backend.command_bar(cmd)
     }
@@ -1233,7 +1421,7 @@ mod tests {
 
     // ── Stub controller behaviour on non-Windows ───────────────
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
     fn stub_controller_focus_ok_inject_err() {
         let mut c = KiroCrewController::new(None);
@@ -1246,5 +1434,23 @@ mod tests {
         assert!(c.apply(&ControlAction::StopDeleteWords).is_ok());
         assert!(c.apply(&ControlAction::StartDeleteWords).is_err());
         assert!(c.apply(&ControlAction::Chord(Chord::Up)).is_err());
+    }
+
+    // ── Window-title needles / target pid ──────────────────────
+
+    #[test]
+    fn candidate_needles_default_and_configured() {
+        assert_eq!(candidate_needles(""), vec!["Kiro Crew".to_string(), "Agentic".to_string()]);
+        assert_eq!(candidate_needles("   "), vec!["Kiro Crew".to_string(), "Agentic".to_string()]);
+        assert_eq!(candidate_needles("My Crew"), vec!["My Crew".to_string()]);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn target_pid_is_none_off_macos() {
+        let mut c = KiroCrewController::new(None);
+        assert_eq!(c.target_pid(), None);
+        let _ = c.focus();
+        assert_eq!(c.target_pid(), None);
     }
 }

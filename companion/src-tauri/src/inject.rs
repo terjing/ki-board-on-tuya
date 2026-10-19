@@ -1,4 +1,7 @@
-//! Keyboard injection into the foreground Windows application.
+//! Keyboard injection into the foreground application (Windows / macOS).
+//!
+//! On macOS the backend is a thin wrapper over `mac_sys` (CGEvent at the HID
+//! tap); the Accessibility grant is checked before every call.
 //!
 //! Phase 1 uses Win32 `SendInput` (Unicode key events) to type transcribed text
 //! and to press editing keys (Enter / Backspace). The real implementation is
@@ -24,7 +27,11 @@ pub fn injector() -> Box<dyn KeyInjector> {
     {
         Box::new(windows_impl::Win32Injector)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(mac_impl::MacInjector)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         Box::new(stub::StubInjector)
     }
@@ -145,9 +152,44 @@ mod windows_impl {
     }
 }
 
-// ─────────────────────────── Non-Windows ───────────────────────────
+// ───────────────────────────── macOS ─────────────────────────────
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod mac_impl {
+    use super::KeyInjector;
+    use crate::{keymap::mac_keycode, mac_sys};
+
+    pub struct MacInjector;
+
+    fn ensure_granted() -> Result<(), String> {
+        if mac_sys::input_permission_granted() {
+            Ok(())
+        } else {
+            Err("Accessibility permission not granted — nothing injected".to_string())
+        }
+    }
+
+    impl KeyInjector for MacInjector {
+        fn type_text(&self, text: &str) -> Result<(), String> {
+            ensure_granted()?;
+            mac_sys::type_text(text)
+        }
+
+        fn press_enter(&self) -> Result<(), String> {
+            ensure_granted()?;
+            mac_sys::post_key(mac_keycode::RETURN)
+        }
+
+        fn press_backspace(&self) -> Result<(), String> {
+            ensure_granted()?;
+            mac_sys::post_key(mac_keycode::DELETE)
+        }
+    }
+}
+
+// ─────────────────────────── Other hosts ───────────────────────────
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod stub {
     use super::KeyInjector;
 
@@ -171,7 +213,7 @@ mod stub {
     }
 }
 
-#[cfg(all(test, not(windows)))]
+#[cfg(all(test, not(any(windows, target_os = "macos"))))]
 mod tests {
     use super::*;
 
