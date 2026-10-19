@@ -58,7 +58,7 @@ Full task breakdown: [docs/implementation-plan.md](docs/implementation-plan.md).
 
 ## Build (skeleton)
 
-Prerequisites: Node 22+, Rust 1.96+. On macOS see
+Prerequisites: Node 22+, Rust 1.98+. On macOS see
 [docs/companion-macos.md](docs/companion-macos.md) (Xcode CLT, Accessibility
 permission, `npm run build:mac`).
 

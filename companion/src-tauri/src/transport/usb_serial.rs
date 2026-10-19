@@ -183,7 +183,7 @@ fn callout_twin(dialin: &str) -> Option<String> {
 pub fn prefer_callout(names: Vec<String>) -> Option<String> {
     let skip = |name: &String| {
         is_macos_dialin(name)
-            && callout_twin(name).map_or(false, |twin| names.iter().any(|n| *n == twin))
+            && callout_twin(name).is_some_and(|twin| names.contains(&twin))
     };
     names
         .iter()
@@ -200,7 +200,7 @@ pub fn hide_dialin_twins(ports: Vec<SerialPortInfo>) -> Vec<SerialPortInfo> {
         .into_iter()
         .filter(|port| {
             !(is_macos_dialin(&port.name)
-                && callout_twin(&port.name).map_or(false, |twin| names.contains(&twin)))
+                && callout_twin(&port.name).is_some_and(|twin| names.contains(&twin)))
         })
         .collect()
 }

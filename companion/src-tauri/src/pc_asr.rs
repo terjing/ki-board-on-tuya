@@ -125,13 +125,27 @@ pub fn dictation_menu_match(title: &str) -> Option<crate::keymap::DictationMenuI
         .trim();
     if t.starts_with("stop dictation") || t.starts_with("停止听写") {
         Some(DictationMenuItem::Stop)
-    } else if t.starts_with("start dictation") || t.starts_with("开始听写") {
-        Some(DictationMenuItem::Start)
     } else if t.contains("dictation") || t.contains("听写") {
         Some(DictationMenuItem::Start)
     } else {
         None
     }
+}
+
+/// True for the primary Start/Stop Dictation entries of the Edit menu
+/// ("Start Dictation…", "Stop Dictation", "开始听写…", "停止听写…"), as opposed
+/// to a localized or unrelated title that merely contains "dictation" / "听写".
+/// The macOS backend uses it to pick the Edit menu among the menu-bar menus.
+pub fn dictation_menu_is_primary(title: &str) -> bool {
+    let lower = title.trim().to_lowercase();
+    let t = lower
+        .strip_suffix('\u{2026}')
+        .or_else(|| lower.strip_suffix("..."))
+        .unwrap_or(&lower)
+        .trim();
+    ["start dictation", "stop dictation", "开始听写", "停止听写"]
+        .iter()
+        .any(|p| t.starts_with(p))
 }
 
 /// `(modifier keycode, device-dependent flags)` for a double-tap trigger; the
@@ -447,6 +461,16 @@ mod tests {
         assert_eq!(dictation_menu_match("听写"), Some(Start));
         assert_eq!(dictation_menu_match("Emoji & Symbols"), None);
         assert_eq!(dictation_menu_match(""), None);
+    }
+
+    #[test]
+    fn dictation_menu_is_primary_only_for_start_stop_titles() {
+        for t in ["Start Dictation\u{2026}", "Stop Dictation", "  start dictation...  ", "开始听写…", "停止听写"] {
+            assert!(dictation_menu_is_primary(t), "{t:?}");
+        }
+        for t in ["Dictation Settings", "Démarrer la dictation", "听写", "Emoji & Symbols", ""] {
+            assert!(!dictation_menu_is_primary(t), "{t:?}");
+        }
     }
 
     #[test]

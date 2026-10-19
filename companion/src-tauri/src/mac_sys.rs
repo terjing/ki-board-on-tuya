@@ -165,6 +165,9 @@ const CMD_KEY_STATE: u32 = 0x0100 >> 8;
 /// How long AX may block on one unresponsive application (plan D3).
 const AX_MESSAGING_TIMEOUT_SECS: f32 = 0.25;
 /// Frontmost poll after asking for activation (plan D3).
+/// Overall time budget for the `find_window` scan (each unresponsive app can
+/// cost one AX messaging timeout per read); an exhausted budget is a no-match.
+const FIND_WINDOW_BUDGET: Duration = Duration::from_secs(2);
 const FRONTMOST_POLL: Duration = Duration::from_millis(200);
 const FRONTMOST_POLL_STEP: Duration = Duration::from_millis(10);
 const FOCUS_SETTLE: Duration = Duration::from_millis(40);
@@ -435,14 +438,17 @@ fn plan_stroke(src: &CGEventSource, keycode: u16, stroke: &KeyStroke, out: &mut 
     let mods = stroke.mods.modifier_keycodes();
     let flags = stroke.mods.cg_flags();
     let push = |out: &mut Vec<Planned>, ev: CGEvent| out.push(Planned { event: ev, pause_after: Duration::ZERO });
+    // Modifier keys are FlagsChanged events (as the OS and double_tap_modifier
+    // produce them), not KeyDown/KeyUp, so apps never see a stray key event.
+    let ft = Some(CGEventType::FlagsChanged);
     for (kc, acc) in &mods {
-        push(out, key_event(src, *kc, true, *acc, None)?);
+        push(out, key_event(src, *kc, true, *acc, ft)?);
     }
     push(out, key_event(src, keycode, true, flags, None)?);
     push(out, key_event(src, keycode, false, flags, None)?);
     for i in (0..mods.len()).rev() {
         let remaining = if i == 0 { 0 } else { mods[i - 1].1 };
-        push(out, key_event(src, mods[i].0, false, remaining, None)?);
+        push(out, key_event(src, mods[i].0, false, remaining, ft)?);
     }
     Ok(())
 }
@@ -681,6 +687,7 @@ fn find_window(needle: &str, exclude_pid: i32, hint_pid: Option<i32>) -> Option<
     if needle_lower.is_empty() {
         return None;
     }
+    let deadline = Instant::now() + FIND_WINDOW_BUDGET;
     if let Some(pid) = hint_pid.filter(|p| *p != exclude_pid) {
         if let Some(app) = AxElement::application(pid) {
             if let Some(win) = matching_window(&app, &needle_lower) {
@@ -689,6 +696,9 @@ fn find_window(needle: &str, exclude_pid: i32, hint_pid: Option<i32>) -> Option<
         }
     }
     for pid in candidate_pids(exclude_pid) {
+        if Instant::now() >= deadline {
+            return None; // budget spent: report no match rather than stall the caller
+        }
         if Some(pid) == hint_pid {
             continue; // already tried
         }
@@ -706,6 +716,21 @@ pub fn find_window_pid_by_title(
     hint_pid: Option<i32>,
 ) -> Option<i32> {
     find_window(needle, exclude_pid, hint_pid).map(|(pid, _, _)| pid)
+}
+
+/// True when `app`'s focused window is `win` (element equality, or the same
+/// non-empty `AXTitle`). A missing focused window is false (fail closed).
+fn is_focused_window(app: &AxElement, win: &AxElement) -> bool {
+    let Some(focused) = app.element_attr("AXFocusedWindow") else {
+        return false;
+    };
+    if focused.0 == win.0 {
+        return true;
+    }
+    match (focused.string_attr("AXTitle"), win.string_attr("AXTitle")) {
+        (Some(a), Some(b)) => !b.is_empty() && a == b,
+        _ => false,
+    }
 }
 
 pub fn focus_window_by_title(
@@ -726,13 +751,14 @@ pub fn focus_window_by_title(
     win.set_bool("AXMain", true);
 
     let deadline = Instant::now() + FRONTMOST_POLL;
-    let mut front = frontmost_pid() == Some(pid);
+    let mut front = frontmost_pid() == Some(pid) && is_focused_window(&app, &win);
     while !front && Instant::now() < deadline {
         sleep(FRONTMOST_POLL_STEP);
-        front = frontmost_pid() == Some(pid);
+        front = frontmost_pid() == Some(pid) && is_focused_window(&app, &win);
     }
     if !front {
-        // Fail closed: injecting while another app is frontmost would type into it.
+        // Fail closed: injecting while another app (or another window of the
+        // matched app) is focused would type into / clear the wrong target.
         return Err(format!(
             "found window {needle:?} (pid {pid}) but macOS did not bring it to the front — nothing injected"
         ));
@@ -742,9 +768,11 @@ pub fn focus_window_by_title(
 }
 
 /// Press a menu-bar item of `pid` (never the frontmost app, never ourselves).
-/// Walks the menu bar's items and their `AXMenu` children one level deep; picks
-/// the first enabled item that `matcher` classifies as `prefer`, else the first
-/// enabled match of any kind. Returns the kind that was pressed.
+/// Walks the menu bar's items and their `AXMenu` children one level deep, then
+/// works inside ONE menu only (the one with a primary Start/Stop Dictation
+/// entry, i.e. Edit, else the first menu with any match): picks the first
+/// enabled item that `matcher` classifies as `prefer`, else the first enabled
+/// match of any kind. Returns the kind that was pressed.
 pub fn press_menu_item(
     pid: i32,
     matcher: fn(&str) -> Option<DictationMenuItem>,
@@ -759,36 +787,43 @@ pub fn press_menu_item(
         .element_attr("AXMenuBar")
         .ok_or_else(|| format!("pid {pid} has no accessible menu bar"))?;
 
-    let mut first_any: Option<(AxElement, DictationMenuItem)> = None;
+    // One group of enabled matches per top-level menu. Only ONE menu is used:
+    // the first whose matches include a primary Start/Stop Dictation entry (the
+    // Edit menu), else the first with any match, so an unrelated item in Help
+    // or View that merely mentions "dictation" is never pressed.
+    let mut groups: Vec<Vec<(AxElement, String, DictationMenuItem)>> = Vec::new();
     for top in bar.elements_attr("AXChildren") {
         for menu in top.elements_attr("AXChildren") {
+            let mut group = Vec::new();
             for item in menu.elements_attr("AXChildren") {
                 let Some(title) = item.string_attr("AXTitle") else { continue };
                 let Some(kind) = matcher(&title) else { continue };
                 if item.bool_attr("AXEnabled") == Some(false) {
                     continue;
                 }
-                if kind == prefer {
-                    return if item.perform("AXPress") {
-                        Ok(kind)
-                    } else {
-                        Err(format!("AXPress on menu item {title:?} failed"))
-                    };
-                }
-                if first_any.is_none() {
-                    first_any = Some((item, kind));
-                }
+                group.push((item, title, kind));
+            }
+            if !group.is_empty() {
+                groups.push(group);
             }
         }
     }
-    match first_any {
-        Some((item, kind)) => {
-            if item.perform("AXPress") {
-                Ok(kind)
-            } else {
-                Err("AXPress on the dictation menu item failed".to_string())
-            }
-        }
-        None => Err("no matching dictation menu item found in the target app's menu bar".to_string()),
+    let home = groups
+        .iter()
+        .position(|g| g.iter().any(|(_, t, _)| crate::pc_asr::dictation_menu_is_primary(t)))
+        .or(if groups.is_empty() { None } else { Some(0) });
+    let Some(home) = home else {
+        return Err("no matching dictation menu item found in the target app's menu bar".to_string());
+    };
+    let group = groups.swap_remove(home);
+    let pick = group
+        .iter()
+        .position(|(_, _, k)| *k == prefer)
+        .unwrap_or(0);
+    let (item, title, kind) = &group[pick];
+    if item.perform("AXPress") {
+        Ok(*kind)
+    } else {
+        Err(format!("AXPress on menu item {title:?} failed"))
     }
 }

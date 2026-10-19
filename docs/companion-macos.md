@@ -219,7 +219,7 @@ in single quotes:
 ```
 
 `<executable>` is the main binary inside the bundle's `Contents/MacOS/`. Use
-the Companion's **Install globally** button (Global Crew hook installation) rather than typing this by hand; it
+the Companion's **Install globally** button (it installs the Global Crew hook) rather than typing this by hand; it
 records the path of the running executable in `~/.kiro/crew/hooks.json`, and
 **Open Crew folder** shows that folder in Finder.
 
@@ -231,14 +231,19 @@ calling the old path. A dev run (`npm run dev`) records the dev binary under
 
 - **Not run on a real Mac yet.** Linking, TCC prompts, real keystrokes, focus,
   dictation, CoreBluetooth and serial enumeration have not been verified.
-- **Keyboard layout switches fail closed.** Right after you switch keyboard
-  layout, board shortcuts that depend on the layout (ClearInput = ⌘A, and the
-  ⌘K command bar) inject **nothing** and log `keyboard layout key … not resolved
-  yet` until the keycode cache refreshes, about 1.5 s (the Companion polls every
-  1.5 s while its window is open, and also refreshes after board actions).
-  Press again after a moment. This is deliberate: a stale keycode could send ⌘Q.
-  Shortcuts that use fixed physical keys (Enter, arrows, delete word, chat jumps,
-  new chat) are not affected.
+- **A layout switch has a millisecond-scale stale-keycode gap.** The Companion
+  clears and refreshes its keycode cache as soon as macOS reports a layout
+  change. In the few milliseconds between the switch and that notification, a
+  board shortcut that depends on the layout (ClearInput = ⌘A, and the ⌘K command
+  bar) still uses the previous layout's keycode. If the notification were ever
+  missed, the next board action would also use the old keycode before its queued
+  refresh runs. This is not fail-closed. Shortcuts that use fixed physical keys
+  (Enter, arrows, delete word, chat jumps, new chat) are not affected.
+- **Layouts without Latin keys fail closed for ⌘A / ⌘K.** If the current layout
+  has no `a` / `k` under ⌘ (for example plain Russian), the keycode cannot be
+  resolved, so ClearInput and the ⌘K command bar inject **nothing** and log
+  `keyboard layout key … not resolved yet`. This is deliberate: a guessed
+  keycode could send ⌘Q. Switch to a Latin layout to use those two shortcuts.
 - **UI test buttons may stutter.** The window-bind, send-text, command-bar and
   chord test buttons run focus and a short settle wait on the UI thread, so the
   window can hitch briefly per click. Board-driven actions do not freeze the UI,
@@ -272,8 +277,9 @@ calling the old path. A dev run (`npm run dev`) records the dev binary under
    button, and a board **nav-up long** press (ClearInput, ⌘A then Delete). For
    each path, test on a US layout; then switch to AZERTY, wait 2 s with the
    Companion window visible and repeat (it must not send ⌘Q or quit the
-   browser; an immediate press may fail closed with a logged `not resolved`
-   error); and with Pinyin active. Then press nav-up long 20 times with the UI
+   browser); with Pinyin active; and with a layout that has no Latin keys under
+   ⌘ (for example plain Russian), where the chords must inject nothing and log
+   `not resolved`. Then press nav-up long 20 times with the UI
    open: none may log `layout key … not resolved`.
 6. K1 jumps to chat 1 (⌃1).
 7. Hold nav-left: it deletes words.
