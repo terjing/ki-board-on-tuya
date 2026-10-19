@@ -212,7 +212,8 @@ mod app {
         slot_display_status, CrewApiClient, CrewConnection, CrewEvent, CrewRealtime, CrewSlot,
         SendReceipt,
     };
-    use crate::pc_asr::{self, VoiceAction, VoiceSource};
+    use crate::pc_asr::{self, DictationTrigger, VoiceAction, VoiceSource};
+    use crate::platform::{self, HostOs};
     use crate::protocol::{self, Inbound, KeyAction};
     use crate::hook_install;
     use crate::kirocrew_control::{Chord, ControlAction, ControlRouter, KiroCrewController};
@@ -243,6 +244,9 @@ mod app {
         logs: Vec<String>,
         last_error: String,
         voice_source: VoiceSource,
+        /// macOS dictation trigger (persisted in `binds.json` as
+        /// `mac_dictation_trigger`); ignored on Windows.
+        mac_dictation_trigger: DictationTrigger,
         /// Last settings state reported by the AK. Defaults match firmware and
         /// is replaced by the board's authoritative values after each hello.
         device_volume: u8,
@@ -327,6 +331,13 @@ mod app {
         crew_api_base_url: String,
         crew_api_last_error: String,
         crew_api_slots: usize,
+        /// `std::env::consts::OS` of the host ("windows", "macos", …); lets the
+        /// UI swap shortcut labels.
+        platform: &'static str,
+        /// `"granted"`, `"missing"` or `"not-required"` (Windows).
+        input_permission: &'static str,
+        /// Canonical wire name of the macOS dictation trigger.
+        mac_dictation_trigger: String,
     }
 
     fn log_line(app: &AppHandle, message: impl Into<String>) {
@@ -495,6 +506,12 @@ mod app {
 
     #[tauri::command]
     fn get_status(state: State<Shared>) -> Result<Status, String> {
+        // Sync command => main thread. Refresh the keyboard-layout cache BEFORE
+        // taking `transport` or `inner` (it only takes its own leaf lock).
+        #[cfg(target_os = "macos")]
+        {
+            let _ = crate::mac_sys::refresh_layout_cache();
+        }
         // Read connectedness from the transport lock first, then release it
         // before taking the inner lock (never hold both at once).
         let device_connected = state
@@ -518,7 +535,41 @@ mod app {
             crew_api_base_url: inner.crew_api_base_url.clone(),
             crew_api_last_error: inner.crew_api_last_error.clone(),
             crew_api_slots: inner.crew_api_slots.len(),
+            platform: std::env::consts::OS,
+            input_permission: platform::input_permission_status(),
+            mac_dictation_trigger: inner.mac_dictation_trigger.as_str().to_string(),
         })
+    }
+
+    /// macOS: show the system Accessibility prompt and open the Privacy pane,
+    /// then report the resulting status (`"granted"` / `"missing"`). Windows
+    /// needs no grant and returns `"not-required"`.
+    #[tauri::command]
+    fn request_input_permission() -> Result<String, String> {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = crate::mac_sys::request_input_permission();
+            if let Some(url) = platform::accessibility_settings_url(HostOs::current()) {
+                platform::open_url(url)?;
+            }
+            Ok(platform::input_permission_status().to_string())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok("not-required".to_string())
+        }
+    }
+
+    /// Choose the macOS dictation trigger by wire name; persists it and returns
+    /// the canonical value (unknown names become `edit-menu`).
+    #[tauri::command]
+    fn set_mac_dictation_trigger(state: State<Shared>, trigger: String) -> Result<String, String> {
+        let mut inner = state.inner.lock().map_err(|_| "state lock poisoned")?;
+        inner.kc_binds.set_mac_dictation_trigger(&trigger);
+        let parsed = DictationTrigger::parse(&inner.kc_binds.mac_dictation_trigger);
+        inner.mac_dictation_trigger = parsed;
+        inner.kc_binds.save()?;
+        Ok(parsed.as_str().to_string())
     }
 
     /// Explicitly (re)start the Crew WebSocket worker. Startup invokes this
@@ -1459,16 +1510,22 @@ mod app {
         Ok(status)
     }
 
-    /// Open the Crew configuration directory containing hooks.json in Explorer.
+    /// Open the Crew configuration directory containing hooks.json in the
+    /// platform file manager (Explorer / Finder).
     #[tauri::command]
     fn kc_open_hooks_folder() -> Result<String, String> {
         let dir = hook_install::hooks_dir().ok_or("cannot resolve Kiro Crew configuration directory")?;
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("create {}: {e}", dir.display()))?;
-        std::process::Command::new("explorer.exe")
-            .arg(&dir)
+        let os = HostOs::current();
+        let (program, args) = platform::reveal_dir_command(os, &dir)
+            .ok_or("opening a folder is not supported on this platform")?;
+        std::process::Command::new(program)
+            .args(args)
             .spawn()
-            .map_err(|e| format!("open {} in Explorer: {e}", dir.display()))?;
+            .map_err(|e| {
+                format!("open {} in {}: {e}", dir.display(), platform::file_manager_name(os))
+            })?;
         Ok(dir.display().to_string())
     }
 
@@ -1604,10 +1661,18 @@ mod app {
                     // unset (0) nothing is injected — selection only.
                     if (1..=9).contains(&jump) {
                         let action = ControlAction::Chord(Chord::JumpChat(jump));
+                        let label = platform::jump_chat_label(HostOs::current(), jump);
                         match exec_control_action(app, state, &action) {
-                            Ok(()) => log_line(app, format!("[CREW-API] jumped Kiro Crew view to Alt+{jump}")),
-                            Err(e) => log_line(app, format!("[CREW-API] Alt+{jump} jump failed: {e}")),
+                            Ok(()) => log_line(app, format!("[CREW-API] jumped Kiro Crew view to {label}")),
+                            Err(e) => log_line(app, format!("[CREW-API] {label} jump failed: {e}")),
                         }
+                        // exec_control_action has returned, so `inner` is no
+                        // longer held. Fire-and-forget: queue a layout-cache
+                        // refresh on the main thread; nothing waits on it.
+                        #[cfg(target_os = "macos")]
+                        let _ = app.run_on_main_thread(|| {
+                            let _ = crate::mac_sys::refresh_layout_cache();
+                        });
                     }
                     return true;
                 }
@@ -1813,11 +1878,21 @@ mod app {
                 // focus alone is enough (the composer is the default focused
                 // control) and can never submit. Best-effort; Win+H still fires if
                 // focus fails (the user may already be on the window).
-                if let Ok(mut inner) = state.inner.lock() {
-                    let _ = inner.kc_controller.focus();
-                }
-                match pc_asr::activator(pc_asr::DictationTrigger::default(), None).activate() {
-                    Ok(()) => log_line(app, "[PC-ASR] focused window + activated OS dictation (Win+H)"),
+                let (trigger, pid) = match state.inner.lock() {
+                    Ok(mut inner) => {
+                        let _ = inner.kc_controller.focus();
+                        (inner.mac_dictation_trigger, inner.kc_controller.target_pid())
+                    }
+                    Err(_) => (DictationTrigger::default(), None),
+                };
+                match pc_asr::activator(trigger, pid).activate() {
+                    Ok(()) => log_line(
+                        app,
+                        format!(
+                            "[PC-ASR] focused window + activated OS dictation ({})",
+                            pc_asr::activation_label(trigger)
+                        ),
+                    ),
                     Err(e) => log_line(app, format!("[PC-ASR] activate failed: {e}")),
                 }
             }
@@ -1841,6 +1916,14 @@ mod app {
                     Ok(()) => log_line(app, format!("[KC-CTL] fallback {desc}")),
                     Err(e) => log_line(app, format!("[KC-CTL] fallback {desc} failed: {e}")),
                 }
+                // exec_control_action has returned, so `inner` is no longer
+                // held. Fire-and-forget: queue a layout-cache refresh on the
+                // main thread; nothing waits on it (the drain thread must
+                // never wait for the main thread).
+                #[cfg(target_os = "macos")]
+                let _ = app.run_on_main_thread(|| {
+                    let _ = crate::mac_sys::refresh_layout_cache();
+                });
             }
         }
 
@@ -1853,6 +1936,7 @@ mod app {
         // and the router's ControlCtx from them so the first board press already
         // jumps to the configured numbers.
         let kc_binds = BindStore::load();
+        let mac_dictation_trigger = DictationTrigger::parse(&kc_binds.mac_dictation_trigger);
         let jump_chats = kc_binds.chats.clone();
         let kc_pinned_session = (!kc_binds.pinned_session.is_empty())
             .then(|| kc_binds.pinned_session.clone());
@@ -1877,6 +1961,7 @@ mod app {
                 logs: Vec::new(),
                 last_error: String::new(),
                 voice_source: VoiceSource::default(),
+                mac_dictation_trigger,
                 device_volume: 70,
                 device_brightness: 100,
                 device_settings_synced: false,
@@ -1908,6 +1993,19 @@ mod app {
             .setup(|app| {
                 let app_handle = app.handle().clone();
                 let shared = app.state::<Shared>().inner().clone();
+                // macOS: `setup` runs on the main thread, so warm the keyboard
+                // layout cache before the first board event. No permission
+                // prompt here; the UI banner offers a button instead.
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = crate::mac_sys::refresh_layout_cache();
+                    if !crate::mac_sys::input_permission_granted() {
+                        log_line(
+                            &app_handle,
+                            "[MAC] Accessibility permission missing — window focus and key injection are disabled until it is granted (use \"Grant Accessibility\" in the Companion window)",
+                        );
+                    }
+                }
                 if let Err(error) = start_crew_realtime(&app_handle, &shared) {
                     if let Ok(mut inner) = shared.inner.lock() {
                         inner.crew_api_last_error = error.clone();
@@ -1926,6 +2024,8 @@ mod app {
                 clear_logs,
                 set_control_enabled,
                 get_status,
+                request_input_permission,
+                set_mac_dictation_trigger,
                 crew_api_start,
                 crew_api_stop,
                 crew_api_list_slots,

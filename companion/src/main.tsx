@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { create as createQrCode } from "qrcode";
 import "./styles.css";
+import { MAC_DICTATION_TRIGGERS, parsePlatform, uiLabels } from "./platform";
 
 // ─── Types mirroring the Rust backend (src-tauri/src/lib.rs) ────────────────
 
@@ -23,6 +24,12 @@ type Status = {
   crew_api_base_url?: string;
   crew_api_last_error?: string;
   crew_api_slots?: number;
+  /** Host OS from the backend (`std::env::consts::OS`): "windows", "macos", … */
+  platform?: string;
+  /** macOS Accessibility grant: "granted" | "missing" | "not-required". */
+  input_permission?: string;
+  /** Canonical macOS dictation trigger wire name. */
+  mac_dictation_trigger?: string;
 };
 
 type CrewSlot = {
@@ -221,6 +228,11 @@ const NAV_LAYOUT: (string | null)[] = [
 
 function App() {
   const [status, setStatus] = useState<Status>(defaultStatus);
+  // Shortcut labels follow the host OS reported by the backend; Windows (and
+  // the pre-first-poll default) keep the original literals.
+  const platform = parsePlatform(status.platform);
+  const labels = uiLabels(platform);
+  const isMac = platform === "macos";
   const [ports, setPorts] = useState<SerialPortInfo[]>([]);
   const [selectedPort, setSelectedPort] = useState("");
   const [transportMode, setTransportMode] = useState<"usb" | "ble">("usb");
@@ -481,6 +493,18 @@ function App() {
   async function toggleControl(enabled: boolean) {
     await invoke("set_control_enabled", { enabled });
     setStatus((s) => ({ ...s, control_enabled: enabled }));
+  }
+
+  // macOS: show the system Accessibility prompt + open the Privacy pane.
+  async function grantAccessibility() {
+    const input_permission = await invoke<string>("request_input_permission");
+    setStatus((s) => ({ ...s, input_permission }));
+  }
+
+  // macOS: choose how K4 starts system dictation (persisted by the backend).
+  async function selectDictationTrigger(trigger: string) {
+    const mac_dictation_trigger = await invoke<string>("set_mac_dictation_trigger", { trigger });
+    setStatus((s) => ({ ...s, mac_dictation_trigger }));
   }
 
   async function selectVoiceSource(source: "cloud" | "system") {
@@ -1119,6 +1143,16 @@ function App() {
           <div className="error-banner">{uiError || status.last_error}</div>
         )}
 
+        {isMac && status.input_permission === "missing" && (
+          <div className="warning-banner" role="alert">
+            <span>
+              Accessibility permission is missing — the Companion cannot focus the Kiro Crew
+              window or inject keystrokes until it is granted.
+            </span>
+            <button onClick={() => runAction(grantAccessibility)}>Grant Accessibility</button>
+          </div>
+        )}
+
         {activeView === "device" && (
           <Panel title="Device Bridge">
             <label>Transport</label>
@@ -1257,10 +1291,32 @@ function App() {
             <p className="hint">
               <strong>Board cloud ASR</strong>: the board mic feeds Tuya cloud ASR; recognized text
               returns as an <code>asr</code> frame. <strong>PC system ASR</strong>: a K4 press sends
-              <code> voice.start</code> and the companion activates Windows dictation (Win+H). The
+              <code> voice.start</code> and the companion activates {labels.dictation}. The
               choice is mirrored to the board (and the board can switch it too — this reflects the
               board's reported path).
             </p>
+            {isMac && (
+              <div className="dictation-trigger">
+                <label htmlFor="mac-dictation-trigger">macOS dictation trigger</label>
+                <select
+                  id="mac-dictation-trigger"
+                  value={status.mac_dictation_trigger ?? "edit-menu"}
+                  onChange={(event) =>
+                    runAction(() => selectDictationTrigger(event.target.value))
+                  }
+                >
+                  {MAC_DICTATION_TRIGGERS.map((t) => (
+                    <option key={t.value} value={t.value}>
+                      {t.label}
+                    </option>
+                  ))}
+                </select>
+                <p className="hint">
+                  Edit-menu works with any shortcut; double-key options must match System
+                  Settings → Keyboard → Dictation. Fn/🌐 cannot be simulated.
+                </p>
+              </div>
+            )}
 
             <label style={{ marginTop: 14 }}>WiFi provisioning (for board cloud ASR)</label>
             <input
@@ -1660,9 +1716,9 @@ function App() {
                 别名在回车或失焦时保存,最多 {ALIAS_MAX_CHARS} 个英文字母、数字、空格或符号。
               </p>
               <p className="hint">
-                末尾的 <strong>切换对话窗格</strong> 是可选加成:设置了 <code>Alt+N</code> 号后,
+                末尾的 <strong>切换对话窗格</strong> 是可选加成:设置了 <code>{labels.jumpChat("N")}</code> 号后,
                 按 K1–K3 在选中对话的同时,还会让 Kiro Crew 界面<strong>跳转到第 N 个对话窗格</strong>
-                (注入 Alt+N,需要 Kiro Crew 窗口可被激活)。选 <strong>"未设置"</strong> 则只选中、不跳转。
+                (注入 {labels.jumpChat("N")},需要 Kiro Crew 窗口可被激活)。选 <strong>"未设置"</strong> 则只选中、不跳转。
                 N 对应 Kiro Crew 侧栏里该对话的位置,侧栏顺序变化时可能需要重设。
               </p>
 
@@ -1723,7 +1779,7 @@ function App() {
                         // Kiro Crew view). 1..=9 = also inject Alt+N on click.
                         value={jumpN}
                         disabled={bindBusy}
-                        aria-label={`Chat ${defaultName} 切换对话窗格 Alt+N`}
+                        aria-label={`Chat ${defaultName} 切换对话窗格 ${labels.jumpChat("N")}`}
                         onChange={(event) =>
                           runBind(() => bindSet(slot, Number(event.target.value)))
                         }
@@ -1731,7 +1787,7 @@ function App() {
                         <option value={0}>未设置 · 不跳转</option>
                         {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((num) => (
                           <option key={num} value={num}>
-                            跳到 Alt+{num}
+                            跳到 {labels.jumpChat(num)}
                           </option>
                         ))}
                       </select>
@@ -1783,7 +1839,7 @@ function App() {
                   Send text
                 </button>
                 <button disabled={lcBusy} onClick={() => runLc(lcCommandBar)}>
-                  Command bar (Ctrl+K)
+                  {labels.commandBar}
                 </button>
               </div>
 
@@ -1893,7 +1949,7 @@ function App() {
 
                     <label>Global hook command</label>
                     <div className="terminal" style={{ whiteSpace: "pre-wrap" }}>
-                      {hookStatus?.command ?? '"<path-to-companion.exe>" --hook'}
+                      {hookStatus?.command ?? labels.hookPlaceholder}
                     </div>
                     <p className="hint">
                       Each Crew ScriptHook invokes this command for dashboard agent turns. The hook
@@ -1924,7 +1980,7 @@ function App() {
               </div>
 
               <p className="hint watched-model-hint">
-                Chat A–C use stable API chats when bound; Alt+1–9 remains the offline fallback.
+                Chat A–C use stable API chats when bound; {labels.jumpChatRange} remains the offline fallback.
                 Watch chooses which live chat can update the keyboard screen.
               </p>
 
@@ -2061,7 +2117,7 @@ function App() {
                         </div>
                         <div className="watched-compact-meta">
                           {boundSlot
-                            ? `Chat ${SLOT_DEFAULT_NAMES[boundSlot - 1]} → Kiro Crew Chat #${binds[boundSlot - 1]} (Alt+${binds[boundSlot - 1]}) · screen label ${bindAliases[boundSlot - 1] || SLOT_DEFAULT_NAMES[boundSlot - 1]}`
+                            ? `Chat ${SLOT_DEFAULT_NAMES[boundSlot - 1]} → Kiro Crew Chat #${binds[boundSlot - 1]} (${labels.jumpChat(binds[boundSlot - 1])}) · screen label ${bindAliases[boundSlot - 1] || SLOT_DEFAULT_NAMES[boundSlot - 1]}`
                             : s.text}
                         </div>
                         {draftForSession && quickBindDraft && (
