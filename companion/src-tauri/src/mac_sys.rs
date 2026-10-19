@@ -757,9 +757,11 @@ pub fn focus_window_by_title(
 /// Press a menu-bar item of `pid` (never the frontmost app, never ourselves).
 /// Walks the menu bar's items and their `AXMenu` children one level deep, then
 /// works inside ONE menu only (the one with a primary Start/Stop Dictation
-/// entry, i.e. Edit, else the first menu with any match): picks the first
-/// enabled item that `matcher` classifies as `prefer`, else the first enabled
-/// match of any kind. Returns the kind that was pressed.
+/// entry, i.e. Edit, else the first menu with any match). Within it, picks the
+/// first enabled item that is (1) a primary entry of the `prefer` kind, else
+/// (2) any primary entry, else (3) any item of the `prefer` kind, else (4) the
+/// first match (see `keymap::pick_dictation_menu_item`). Returns the kind that
+/// was pressed.
 pub fn press_menu_item(
     pid: i32,
     matcher: fn(&str) -> Option<DictationMenuItem>,
@@ -795,19 +797,16 @@ pub fn press_menu_item(
             }
         }
     }
-    let home = groups
+    let titles: Vec<Vec<(&str, DictationMenuItem)>> = groups
         .iter()
-        .position(|g| g.iter().any(|(_, t, _)| crate::pc_asr::dictation_menu_is_primary(t)))
-        .or(if groups.is_empty() { None } else { Some(0) });
-    let Some(home) = home else {
+        .map(|g| g.iter().map(|(_, t, k)| (t.as_str(), *k)).collect())
+        .collect();
+    let Some((g, i)) =
+        keymap::pick_dictation_menu_item(&titles, prefer, crate::pc_asr::dictation_menu_is_primary)
+    else {
         return Err("no matching dictation menu item found in the target app's menu bar".to_string());
     };
-    let group = groups.swap_remove(home);
-    let pick = group
-        .iter()
-        .position(|(_, _, k)| *k == prefer)
-        .unwrap_or(0);
-    let (item, title, kind) = &group[pick];
+    let (item, title, kind) = &groups[g][i];
     if item.perform("AXPress") {
         Ok(*kind)
     } else {

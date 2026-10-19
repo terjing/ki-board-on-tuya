@@ -240,6 +240,39 @@ pub(crate) fn resolve_stroke_codes(
     Ok(codes)
 }
 
+/// Pick the Edit-menu dictation item to press. `groups[g][i] = (title, kind)`
+/// of the enabled matches of top-level menu `g`.
+///
+/// Home group = the first group with any title for which `is_primary(title)`,
+/// else the first non-empty group (empty groups are skipped; `mac_sys` never
+/// builds one). Within it, the first item that is:
+///   1. `is_primary(title) && kind == prefer`, else
+///   2. `is_primary(title)`, else
+///   3. `kind == prefer`, else
+///   4. item 0.
+///
+/// `None` when there is no non-empty group. `is_primary` is a parameter so this
+/// module keeps no `pc_asr` dependency.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn pick_dictation_menu_item<S: AsRef<str>>(
+    groups: &[Vec<(S, DictationMenuItem)>],
+    prefer: DictationMenuItem,
+    is_primary: fn(&str) -> bool,
+) -> Option<(usize, usize)> {
+    let home = groups
+        .iter()
+        .position(|g| g.iter().any(|(t, _)| is_primary(t.as_ref())))
+        .or_else(|| groups.iter().position(|g| !g.is_empty()))?;
+    let group = &groups[home];
+    let item = group
+        .iter()
+        .position(|(t, k)| is_primary(t.as_ref()) && *k == prefer)
+        .or_else(|| group.iter().position(|(t, _)| is_primary(t.as_ref())))
+        .or_else(|| group.iter().position(|(_, k)| *k == prefer))
+        .unwrap_or(0);
+    Some((home, item))
+}
+
 /// Split `text` into UTF-16 chunks of at most `max_units` (clamped to ≥ 2)
 /// without splitting a surrogate pair.
 pub fn utf16_chunks(text: &str, max_units: usize) -> Vec<Vec<u16>> {
@@ -537,6 +570,71 @@ mod tests {
         assert!(!err.contains("'a'"), "{err}");
     }
 
+    fn pick(titles: &[&[&str]], prefer: DictationMenuItem) -> Option<(usize, usize)> {
+        // Kinds come from the real matcher, as in production.
+        let groups: Vec<Vec<(&str, DictationMenuItem)>> = titles
+            .iter()
+            .map(|g| {
+                g.iter()
+                    .map(|t| (*t, crate::pc_asr::dictation_menu_match(t).expect(t)))
+                    .collect()
+            })
+            .collect();
+        pick_dictation_menu_item(&groups, prefer, crate::pc_asr::dictation_menu_is_primary)
+    }
+
+    #[test]
+    fn pick_menu_prefers_edit_menu_over_earlier_unrelated_menu() {
+        let got = pick(&[&["Dictation Help"], &["Start Dictation…"]], DictationMenuItem::Start);
+        assert_eq!(got, Some((1, 0)));
+    }
+
+    #[test]
+    fn pick_menu_prefers_requested_kind_among_primary() {
+        let edit: &[&str] = &["Start Dictation…", "Stop Dictation"];
+        assert_eq!(pick(&[edit], DictationMenuItem::Stop), Some((0, 1)));
+        assert_eq!(pick(&[edit], DictationMenuItem::Start), Some((0, 0)));
+        assert_eq!(pick(&[&["Start Dictation…"]], DictationMenuItem::Stop), Some((0, 0)));
+    }
+
+    #[test]
+    fn pick_menu_cjk_titles() {
+        let got = pick(&[&["开始听写…", "停止听写"]], DictationMenuItem::Stop);
+        assert_eq!(got, Some((0, 1)));
+    }
+
+    #[test]
+    fn pick_menu_without_primary_falls_back_to_first_group() {
+        assert_eq!(
+            pick(&[&["Démarrer la dictation"], &["Dictation Settings"]], DictationMenuItem::Start),
+            Some((0, 0))
+        );
+        assert_eq!(pick(&[], DictationMenuItem::Start), None);
+        assert_eq!(pick(&[&[], &["Stop Dictation"]], DictationMenuItem::Stop), Some((1, 0)));
+        // Localized fallback kept: no primary item anywhere → item 0.
+        assert_eq!(pick(&[&["Dictation Settings"]], DictationMenuItem::Stop), Some((0, 0)));
+    }
+
+    #[test]
+    fn pick_menu_skips_unrelated_item_before_start_when_prefer_stop() {
+        // Production call with dictation off (build-review-r2 #3): the old code
+        // pressed item 0, the unrelated "Dictation Help".
+        let got = pick(&[&["Dictation Help", "Start Dictation…"]], DictationMenuItem::Stop);
+        assert_eq!(got, Some((0, 1)));
+    }
+
+    #[test]
+    fn pick_menu_primary_beats_earlier_same_kind_match() {
+        let got = pick(&[&["Dictation Help", "Start Dictation…"]], DictationMenuItem::Start);
+        assert_eq!(got, Some((0, 1)));
+    }
+
+    #[test]
+    fn pick_menu_primary_stop_beats_earlier_unrelated() {
+        let got = pick(&[&["Dictation Help", "Stop Dictation"]], DictationMenuItem::Stop);
+        assert_eq!(got, Some((0, 1)));
+    }
+
     /// Deliberate source-grep gate (mac_sys is not compiled on Linux, so this is
     /// the only Linux-side guard). It also fails on a *comment* that mentions
     /// `dispatch_` or the ANSI char-to-keycode table, and that is intentional:
@@ -556,7 +654,12 @@ mod tests {
         }
         assert!(!mac_sys.contains(dispatch), "mac_sys.rs must not use dispatch queues");
         // Pins the pure-core wiring on a Linux host.
-        for call in ["resolve_stroke_codes(", "scan_window_pids(", "focused_window_matches("] {
+        for call in [
+            "resolve_stroke_codes(",
+            "pick_dictation_menu_item(",
+            "scan_window_pids(",
+            "focused_window_matches(",
+        ] {
             assert!(mac_sys.contains(call), "mac_sys.rs must call {call}");
         }
     }
