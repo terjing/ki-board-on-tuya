@@ -331,6 +331,64 @@ mod tests {
         );
     }
 
+    /// Run the POSIX hook command through a real `/bin/sh` with `printf '%s\0'`
+    /// as the "program" and return the NUL-split argv it would receive.
+    #[cfg(unix)]
+    fn sh_argv(exe: &str) -> Vec<Vec<u8>> {
+        let script = format!("printf '%s\\0' {}", hook_command_for(HookShell::Posix, exe));
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("spawn /bin/sh");
+        assert!(out.status.success(), "{script:?}: {:?}", out.status);
+        let mut parts: Vec<Vec<u8>> = out.stdout.split(|b| *b == 0).map(|p| p.to_vec()).collect();
+        // The output ends with a NUL, so the last split piece is empty.
+        assert_eq!(parts.pop().as_deref(), Some(&b""[..]), "{script:?}");
+        parts
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_hook_command_round_trips_through_sh() {
+        for exe in [
+            "/Applications/AK Companion.app/Contents/MacOS/companion",
+            "/Users/it's/companion",
+            "/Users/it''s/companion",
+            "/a/$HOME/c",
+            "/a/`x`/c",
+            "/a/$(printf PWNED)/c",
+            "/a/\"b\"/c",
+            "/a/b\\c/d",
+            "/a/*?/c",
+            "/a/;true/c",
+        ] {
+            assert_eq!(
+                sh_argv(exe),
+                vec![exe.as_bytes().to_vec(), b"--hook".to_vec()],
+                "{exe:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_hook_command_literals() {
+        assert_eq!(hook_command_for(HookShell::Posix, "/a/$HOME/c"), "'/a/$HOME/c' --hook");
+        assert_eq!(hook_command_for(HookShell::Posix, "a\"b"), "'a\"b' --hook");
+        assert_eq!(
+            hook_command_for(HookShell::Posix, "a''b"),
+            "'a'\\'''\\''b' --hook"
+        );
+    }
+
+    #[test]
+    fn windows_hook_command_wraps_verbatim() {
+        assert_eq!(
+            hook_command_for(HookShell::Windows, "C:\\it's $x\\c.exe"),
+            "\"C:\\it's $x\\c.exe\" --hook"
+        );
+    }
+
     #[test]
     fn hook_command_uses_current_shell() {
         let exe = "/opt/companion";

@@ -522,6 +522,127 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dictation_menu_match_ignores_speech_and_other_edit_items() {
+        // Edit ▸ Speech sits right next to Dictation in the Edit menu.
+        for t in [
+            "Start Speaking",
+            "Stop Speaking",
+            "Speech",
+            "Select All",
+            "Find\u{2026}",
+            "AutoFill",
+            "Stop",
+        ] {
+            assert_eq!(dictation_menu_match(t), None, "{t:?}");
+        }
+    }
+
+    #[test]
+    fn dictation_menu_match_case_spacing_and_dots() {
+        use crate::keymap::DictationMenuItem::{Start, Stop};
+        assert_eq!(dictation_menu_match("STOP DICTATION\u{2026}"), Some(Stop));
+        assert_eq!(dictation_menu_match("Start Dictation \u{2026}"), Some(Start));
+        assert_eq!(dictation_menu_match("停止听写..."), Some(Stop));
+        assert_eq!(dictation_menu_match("\tStop Dictation\n"), Some(Stop));
+        // "Stop" only wins by prefix; anything else mentioning dictation falls
+        // back to Start (documents the contains-fallback).
+        assert_eq!(dictation_menu_match("Don't stop dictation"), Some(Start));
+    }
+
+    #[test]
+    fn primary_titles_always_match() {
+        // The R2 home-group rule relies on: primary ⇒ matchable.
+        for t in [
+            "Start Dictation",
+            "Start Dictation\u{2026}",
+            "Start Dictation...",
+            "START DICTATION",
+            "  start dictation  ",
+            "Stop Dictation",
+            "Stop Dictation\u{2026}",
+            "开始听写",
+            "开始听写…",
+            "停止听写",
+            "停止听写...",
+            "Dictation Help",
+            "Démarrer la dictation",
+            "",
+        ] {
+            if dictation_menu_is_primary(t) {
+                assert!(dictation_menu_match(t).is_some(), "{t:?}");
+            }
+        }
+        // Guard against a vacuous loop: the canonical titles really are primary.
+        assert!(dictation_menu_is_primary("Start Dictation\u{2026}"));
+        assert!(dictation_menu_is_primary("停止听写"));
+    }
+
+    #[test]
+    fn double_tap_spec_agrees_with_keymap_constants() {
+        use crate::keymap::{mac_keycode, Mods};
+        let ctrl = Mods { ctrl: true, ..Mods::default() }.cg_flags();
+        let cmd = Mods { cmd: true, ..Mods::default() }.cg_flags();
+
+        let (code, flags) = double_tap_spec(DictationTrigger::DoubleControl).unwrap();
+        assert_eq!(code, mac_keycode::CONTROL);
+        assert_eq!(flags & !0xFF, ctrl);
+        assert_eq!(flags & 0xFF, 0x01);
+
+        let (code, flags) = double_tap_spec(DictationTrigger::DoubleRightCommand).unwrap();
+        assert_eq!(code, mac_keycode::RIGHT_COMMAND);
+        assert_eq!(flags & !0xFF, cmd);
+        assert_eq!(flags & 0xFF, 0x10);
+
+        let (code, flags) = double_tap_spec(DictationTrigger::DoubleLeftCommand).unwrap();
+        assert_eq!(code, mac_keycode::COMMAND);
+        assert_eq!(flags & !0xFF, cmd);
+        assert_eq!(flags & 0xFF, 0x08);
+    }
+
+    #[test]
+    fn trigger_parse_rejects_near_misses() {
+        for s in ["double control", "doublecontrol", "fn", "double-fn", "edit menu"] {
+            assert_eq!(DictationTrigger::parse(s), DictationTrigger::EditMenu, "{s:?}");
+        }
+        assert_eq!(
+            DictationTrigger::parse("DOUBLE-LEFT-COMMAND\n"),
+            DictationTrigger::DoubleLeftCommand
+        );
+    }
+
+    const ALL_TRIGGERS: [DictationTrigger; 4] = [
+        DictationTrigger::EditMenu,
+        DictationTrigger::DoubleControl,
+        DictationTrigger::DoubleRightCommand,
+        DictationTrigger::DoubleLeftCommand,
+    ];
+
+    #[test]
+    fn activation_label_for_every_trigger() {
+        use crate::platform::HostOs;
+        for t in ALL_TRIGGERS {
+            assert_eq!(activation_label_for(HostOs::Windows, t), "Win+H");
+            assert_eq!(activation_label_for(HostOs::Other, t), "unsupported");
+            assert_eq!(
+                activation_label_for(HostOs::Macos, t),
+                format!("macOS Dictation ({})", t.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn mac_plan_double_tap_matches_spec_for_each_trigger() {
+        for t in ALL_TRIGGERS {
+            let Some((code, flags)) = double_tap_spec(t) else {
+                continue;
+            };
+            assert_eq!(plan_mac_activation(t, Some(7), 1), Ok(MacPlan::DoubleTap(code, flags)));
+        }
+        // Exactly the 3 double-tap triggers were covered.
+        assert_eq!(ALL_TRIGGERS.iter().filter(|t| double_tap_spec(**t).is_some()).count(), 3);
+    }
+
     #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
     fn stub_activator_unavailable_and_ok() {

@@ -335,6 +335,31 @@ mod tests {
     }
 
     #[test]
+    fn prefer_callout_with_two_devices_keeps_first_device() {
+        let pick = |v: &[&str]| prefer_callout(v.iter().map(|s| s.to_string()).collect());
+        assert_eq!(
+            pick(&["/dev/tty.A", "/dev/cu.A", "/dev/tty.B", "/dev/cu.B"]).as_deref(),
+            Some("/dev/cu.A")
+        );
+        // tty.B has no twin, so it stays and, being first, wins.
+        assert_eq!(
+            pick(&["/dev/tty.B", "/dev/tty.A", "/dev/cu.A"]).as_deref(),
+            Some("/dev/tty.B")
+        );
+    }
+
+    #[test]
+    fn prefer_callout_ignores_linux_tty_names() {
+        let pick = |v: &[&str]| prefer_callout(v.iter().map(|s| s.to_string()).collect());
+        assert_eq!(
+            pick(&["/dev/ttyUSB0", "/dev/ttyACM0"]).as_deref(),
+            Some("/dev/ttyUSB0")
+        );
+        // Different names are not twins.
+        assert_eq!(pick(&["/dev/tty.x", "/dev/cu.y"]).as_deref(), Some("/dev/tty.x"));
+    }
+
+    #[test]
     fn prefer_callout_keeps_lone_tty_and_windows_order() {
         assert_eq!(
             prefer_callout(vec!["/dev/tty.usbserial-1".to_string()]).as_deref(),
