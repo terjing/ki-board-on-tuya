@@ -151,6 +151,38 @@ mod tests {
     }
 
     #[test]
+    fn reveal_dir_macos_passes_metacharacters_verbatim() {
+        // Spawned without a shell, so no quoting or escaping is added.
+        let raw = "/Users/a'b/$HOME/\"x\"";
+        let (prog, args) = reveal_dir_command(HostOs::Macos, Path::new(raw)).unwrap();
+        assert_eq!(prog, "open");
+        assert_eq!(args, vec![OsString::from(raw)]);
+    }
+
+    #[test]
+    fn reveal_dir_windows_unicode_path_single_arg() {
+        let raw = "C:\\Users\\测试\\.kiro\\crew";
+        let (prog, args) = reveal_dir_command(HostOs::Windows, Path::new(raw)).unwrap();
+        assert_eq!(prog, "explorer.exe");
+        assert_eq!(args, vec![OsString::from(raw)]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_os_current_is_other_on_linux() {
+        assert_eq!(HostOs::current(), HostOs::Other);
+    }
+
+    #[test]
+    fn jump_chat_labels_all_digits() {
+        for n in 1..=9u8 {
+            assert_eq!(jump_chat_label(HostOs::Windows, n), format!("Alt+{n}"));
+            assert_eq!(jump_chat_label(HostOs::Other, n), format!("Alt+{n}"));
+            assert_eq!(jump_chat_label(HostOs::Macos, n), format!("\u{2303}{n}"));
+        }
+    }
+
+    #[test]
     fn jump_chat_labels() {
         assert_eq!(jump_chat_label(HostOs::Windows, 3), "Alt+3");
         assert_eq!(jump_chat_label(HostOs::Other, 9), "Alt+9");

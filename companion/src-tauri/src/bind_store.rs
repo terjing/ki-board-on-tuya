@@ -451,4 +451,57 @@ mod tests {
         assert_eq!(s.mac_dictation_trigger, "");
         assert!(!serde_json::to_string(&s).unwrap().contains("mac_dictation_trigger"));
     }
+
+    #[test]
+    fn set_trigger_canonicalises_unknown_and_spaced_names() {
+        let mut s = BindStore::new();
+        s.set_mac_dictation_trigger("fn-fn");
+        assert_eq!(s.mac_dictation_trigger, "edit-menu");
+        s.set_mac_dictation_trigger(" Double-Right-Command ");
+        assert_eq!(s.mac_dictation_trigger, "double-right-command");
+    }
+
+    #[test]
+    fn stored_trigger_parses_back() {
+        use crate::pc_asr::DictationTrigger;
+        for t in [
+            DictationTrigger::EditMenu,
+            DictationTrigger::DoubleControl,
+            DictationTrigger::DoubleRightCommand,
+            DictationTrigger::DoubleLeftCommand,
+        ] {
+            let mut s = BindStore::new();
+            s.set_mac_dictation_trigger(t.as_str());
+            assert_eq!(DictationTrigger::parse(&s.mac_dictation_trigger), t);
+        }
+        // A blank field (legacy file) takes the lib.rs load path to the default.
+        let blank = BindStore::new();
+        assert_eq!(blank.mac_dictation_trigger, "");
+        assert_eq!(
+            DictationTrigger::parse(&blank.mac_dictation_trigger),
+            DictationTrigger::EditMenu
+        );
+    }
+
+    #[test]
+    fn file_with_trigger_keeps_legacy_fields() {
+        let json = r#"{"chats":[4,0,8],"aliases":["Plan","","B"],"sessions":["dashboard:chat-4","","dashboard:chat-8"],"pinned_session":"dashboard:chat-4","mac_dictation_trigger":"double-left-command"}"#;
+        let mut s: BindStore = serde_json::from_str(json).unwrap();
+        s.normalize();
+        assert_eq!(s.chats, vec![4, 0, 8]);
+        assert_eq!(s.aliases, vec!["Plan", "", "B"]);
+        assert_eq!(s.sessions, vec!["dashboard:chat-4", "", "dashboard:chat-8"]);
+        assert_eq!(s.pinned_session, "dashboard:chat-4");
+        assert_eq!(s.mac_dictation_trigger, "double-left-command");
+        assert_eq!(serde_json::to_string(&s).unwrap(), json);
+    }
+
+    #[test]
+    fn unknown_future_keys_are_ignored() {
+        let mut s: BindStore =
+            serde_json::from_str(r#"{"chats":[1,2,3],"future_key":1}"#).unwrap();
+        s.normalize();
+        assert_eq!(s.chats, vec![1, 2, 3]);
+        assert_eq!(s.mac_dictation_trigger, "");
+    }
 }
