@@ -11,6 +11,12 @@
 //! without the `libudev` feature, so `available_ports()` returns nothing at
 //! runtime there — enumeration is exercised on the Windows target only, but the
 //! code compiles and the pure matching logic is tested everywhere.
+//!
+//! macOS lists every USB serial device twice: `/dev/tty.*` (dial-in) and
+//! `/dev/cu.*` (callout). Board discovery prefers the `cu.*` node and the UI
+//! dropdown hides the `tty.*` twin; on Windows (`COMn`) both are no-ops. The
+//! CH340 has a built-in driver on macOS 11+; CH342F/CH343 need WCH's
+//! CH34xVCPDriver.
 
 use super::{BoardTransport, LineSender, TransportKind};
 use crate::diagnostics;
@@ -155,30 +161,83 @@ pub fn port_kind(port_type: &SerialPortType) -> &'static str {
     }
 }
 
-/// Find the first port that looks like the board's CH34x bridge.
+const MACOS_DIALIN_PREFIX: &str = "/dev/tty.";
+const MACOS_CALLOUT_PREFIX: &str = "/dev/cu.";
+
+/// True for a macOS dial-in device node (`/dev/tty.<name>`).
+pub fn is_macos_dialin(name: &str) -> bool {
+    name.starts_with(MACOS_DIALIN_PREFIX)
+}
+
+/// The `/dev/cu.<name>` twin of a `/dev/tty.<name>` node.
+fn callout_twin(dialin: &str) -> Option<String> {
+    dialin
+        .strip_prefix(MACOS_DIALIN_PREFIX)
+        .map(|rest| format!("{MACOS_CALLOUT_PREFIX}{rest}"))
+}
+
+/// Pick the port to open from every matching candidate: the first candidate,
+/// except that a macOS `tty.*` node whose `cu.*` twin is also present is
+/// skipped in favour of the twin. Windows names (`COM5`) are returned in
+/// enumeration order, so the Windows result is unchanged.
+pub fn prefer_callout(names: Vec<String>) -> Option<String> {
+    let skip = |name: &String| {
+        is_macos_dialin(name)
+            && callout_twin(name).map_or(false, |twin| names.iter().any(|n| *n == twin))
+    };
+    names
+        .iter()
+        .find(|name| !skip(name))
+        .or_else(|| names.first())
+        .cloned()
+}
+
+/// Drop each `/dev/tty.*` entry whose `/dev/cu.*` twin is also listed. Keeps
+/// order; anything else (including `COM` names) passes through untouched.
+pub fn hide_dialin_twins(ports: Vec<SerialPortInfo>) -> Vec<SerialPortInfo> {
+    let names: Vec<String> = ports.iter().map(|p| p.name.clone()).collect();
+    ports
+        .into_iter()
+        .filter(|port| {
+            !(is_macos_dialin(&port.name)
+                && callout_twin(&port.name).map_or(false, |twin| names.contains(&twin)))
+        })
+        .collect()
+}
+
+/// Find the port that looks like the board's CH34x bridge (on macOS the
+/// callout `cu.*` node is preferred over its `tty.*` twin).
 pub fn discover_board_port() -> Option<String> {
-    serialport::available_ports().ok()?.into_iter().find_map(|port| {
-        if let SerialPortType::UsbPort(info) = &port.port_type {
-            let product = info.product.clone().unwrap_or_default();
-            if is_board_port(info.vid, info.pid, &product) {
-                return Some(port.port_name);
+    let matches: Vec<String> = serialport::available_ports()
+        .ok()?
+        .into_iter()
+        .filter_map(|port| {
+            if let SerialPortType::UsbPort(info) = &port.port_type {
+                let product = info.product.clone().unwrap_or_default();
+                if is_board_port(info.vid, info.pid, &product) {
+                    return Some(port.port_name);
+                }
             }
-        }
-        None
-    })
+            None
+        })
+        .collect();
+    prefer_callout(matches)
 }
 
 /// Enumerate all serial ports with a coarse classification for the UI dropdown.
+/// macOS `tty.*` twins of a listed `cu.*` node are hidden.
 pub fn list_serial_ports() -> Result<Vec<SerialPortInfo>, String> {
     let ports =
         serialport::available_ports().map_err(|err| format!("list serial ports failed: {err}"))?;
-    Ok(ports
-        .into_iter()
-        .map(|port| SerialPortInfo {
-            kind: port_kind(&port.port_type).to_string(),
-            name: port.port_name,
-        })
-        .collect())
+    Ok(hide_dialin_twins(
+        ports
+            .into_iter()
+            .map(|port| SerialPortInfo {
+                kind: port_kind(&port.port_type).to_string(),
+                name: port.port_name,
+            })
+            .collect(),
+    ))
 }
 
 /// Read bytes off the port, reassemble complete lines, and forward them.
@@ -240,6 +299,80 @@ mod tests {
     fn rejects_other_vendors_and_names() {
         assert!(!is_board_port(0x0403, CH340_PID, "FTDI")); // right pid, wrong vid
         assert!(!is_board_port(WCH_VID, 0x9999, "Some Other Device"));
+    }
+
+    fn info(name: &str) -> SerialPortInfo {
+        SerialPortInfo {
+            name: name.to_string(),
+            kind: "serial".to_string(),
+        }
+    }
+
+    fn names(ports: &[SerialPortInfo]) -> Vec<&str> {
+        ports.iter().map(|p| p.name.as_str()).collect()
+    }
+
+    #[test]
+    fn is_macos_dialin_matches_only_tty_dot() {
+        assert!(is_macos_dialin("/dev/tty.usbserial-1410"));
+        assert!(!is_macos_dialin("/dev/cu.usbserial-1410"));
+        assert!(!is_macos_dialin("/dev/ttyUSB0"));
+        assert!(!is_macos_dialin("COM5"));
+    }
+
+    #[test]
+    fn prefer_callout_picks_cu_from_a_tty_cu_pair() {
+        for order in [
+            vec!["/dev/tty.usbserial-1410", "/dev/cu.usbserial-1410"],
+            vec!["/dev/cu.usbserial-1410", "/dev/tty.usbserial-1410"],
+        ] {
+            let list = order.into_iter().map(String::from).collect();
+            assert_eq!(
+                prefer_callout(list).as_deref(),
+                Some("/dev/cu.usbserial-1410")
+            );
+        }
+    }
+
+    #[test]
+    fn prefer_callout_keeps_lone_tty_and_windows_order() {
+        assert_eq!(
+            prefer_callout(vec!["/dev/tty.usbserial-1".to_string()]).as_deref(),
+            Some("/dev/tty.usbserial-1")
+        );
+        assert_eq!(
+            prefer_callout(vec!["COM5".to_string(), "COM3".to_string()]).as_deref(),
+            Some("COM5")
+        );
+        assert_eq!(prefer_callout(Vec::new()), None);
+    }
+
+    #[test]
+    fn hide_dialin_twins_drops_tty_only_when_twin_exists() {
+        let ports = vec![
+            info("/dev/tty.usbserial-1"),
+            info("/dev/cu.usbserial-1"),
+            info("/dev/tty.lonely"),
+            info("COM3"),
+            info("/dev/cu.Bluetooth-Incoming-Port"),
+            info("/dev/tty.Bluetooth-Incoming-Port"),
+        ];
+        let out = hide_dialin_twins(ports);
+        assert_eq!(
+            names(&out),
+            vec![
+                "/dev/cu.usbserial-1",
+                "/dev/tty.lonely",
+                "COM3",
+                "/dev/cu.Bluetooth-Incoming-Port"
+            ]
+        );
+    }
+
+    #[test]
+    fn hide_dialin_twins_leaves_windows_names_untouched() {
+        let out = hide_dialin_twins(vec![info("COM5"), info("COM3")]);
+        assert_eq!(names(&out), vec!["COM5", "COM3"]);
     }
 
     #[test]
