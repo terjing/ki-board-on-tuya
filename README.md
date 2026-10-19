@@ -27,9 +27,9 @@ improve the Kiro CLI / IDE development experience. Its differentiators are
 - **Firmware (TuyaOpen C)**: input scan + debounce → event & state machine →
   LVGL @ ST7789 UI + pluggable transport (UART / BLE GATT / BLE HID).
 - **Companion (Tauri: Rust + React/TS)**: transport backend + protocol parser →
-  event routing/mapping → Win32 SendInput injection / clipboard paste / Windows
-  system ASR → inject into the focused Kiro window; Kiro CLI hook (JSONL) →
-  reflect Agent status back to the board.
+  event routing/mapping → Win32 SendInput / macOS CGEvent injection / clipboard
+  paste / Windows or macOS system dictation → inject into the focused Kiro
+  window; Kiro CLI hook (JSONL) → reflect Agent status back to the board.
 
 ## Roadmap (phased, each independently demoable)
 
@@ -58,12 +58,14 @@ Full task breakdown: [docs/implementation-plan.md](docs/implementation-plan.md).
 
 ## Build (skeleton)
 
-Prerequisites: Node 22+, Rust 1.96+.
+Prerequisites: Node 22+, Rust 1.96+. On macOS see
+[docs/companion-macos.md](docs/companion-macos.md) (Xcode CLT, Accessibility
+permission, `npm run build:mac`).
 
 ```bash
 cd companion
 npm ci
-npm run tauri dev        # launch the skeleton window
+npm run dev              # launch the skeleton window
 cd src-tauri && cargo test   # run protocol/transport unit tests
 ```
 
@@ -73,6 +75,7 @@ cd src-tauri && cargo test   # run protocol/transport unit tests
 |-----|---------|
 | [prd.md](docs/prd.md) | **Product requirements (for circuit review & code dev)** |
 | [implementation-plan.md](docs/implementation-plan.md) | Requirements, decisions, 16-task plan |
+| [companion-macos.md](docs/companion-macos.md) | Companion on macOS: build, permissions, chord mapping, limits |
 | [protocol.md](docs/protocol.md) | Protocol reader's guide (points to the source) |
 | [shared/protocol/protocol.md](shared/protocol/protocol.md) | Authoritative protocol spec |
 | [hardware/pinmap/](hardware/pinmap/) | Pin map, netlist, BOM, conflict checker |

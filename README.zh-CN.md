@@ -54,12 +54,13 @@
 
 ## 构建（骨架）
 
-前置：Node 22+、Rust 1.96+。
+前置：Node 22+、Rust 1.96+。macOS 构建与权限说明见
+[docs/companion-macos.md](docs/companion-macos.md)（英文）。
 
 ```bash
 cd companion
 npm ci
-npm run tauri dev        # 启动骨架窗口
+npm run dev              # 启动骨架窗口
 cd src-tauri && cargo test   # 运行协议/传输层单元测试
 ```
 
