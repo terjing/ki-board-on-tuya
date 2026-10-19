@@ -215,6 +215,31 @@ pub fn mac_chord_strokes(c: crate::kirocrew_control::Chord) -> Result<Vec<KeyStr
     })
 }
 
+/// Resolve each stroke's keycode. `MacKey::Code(k)` → k (`lookup` NOT called);
+/// `MacKey::Char(c)` → `lookup(c, stroke.mods.cmd)`. The first miss returns
+/// `Err("keyboard layout key '{c}' not resolved yet — nothing injected (open the Companion window once)")`
+/// and no codes. Never falls back to [`ansi_keycode_for_char`] (fail closed: a
+/// wrong physical code on a non-US layout could turn ⌘A into ⌘Q).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn resolve_stroke_codes(
+    strokes: &[KeyStroke],
+    mut lookup: impl FnMut(char, bool) -> Option<u16>,
+) -> Result<Vec<u16>, String> {
+    let mut codes = Vec::with_capacity(strokes.len());
+    for s in strokes {
+        let code = match s.key {
+            MacKey::Code(k) => k,
+            MacKey::Char(c) => lookup(c, s.mods.cmd).ok_or_else(|| {
+                format!(
+                    "keyboard layout key '{c}' not resolved yet — nothing injected (open the Companion window once)"
+                )
+            })?,
+        };
+        codes.push(code);
+    }
+    Ok(codes)
+}
+
 /// Split `text` into UTF-16 chunks of at most `max_units` (clamped to ≥ 2)
 /// without splitting a surrogate pair.
 pub fn utf16_chunks(text: &str, max_units: usize) -> Vec<Vec<u16>> {
@@ -389,6 +414,150 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn cmd_strokes_use_char_keys_only() {
+        // No ⌘ ever pairs with a hard-coded physical code: on AZERTY, ANSI 0x00
+        // is Q, so ⌘+0x00 would be ⌘Q (quit).
+        for c in all_chords() {
+            for s in mac_chord_strokes(c).unwrap() {
+                assert_eq!(
+                    s.mods.cmd,
+                    matches!(s.key, MacKey::Char(_)),
+                    "{c:?}: cmd and Char keys must go together ({s:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_chord_plans_cmd_q() {
+        // Readable guard; implied by cmd_strokes_use_char_keys_only + d4_chord_table.
+        let cmd = Mods { cmd: true, ..Mods::default() };
+        let bad = [
+            stroke(cmd, MacKey::Char('q')),
+            stroke(cmd, MacKey::Code(0x0C)), // ANSI Q
+            stroke(cmd, MacKey::Code(0x00)), // ANSI A = AZERTY Q
+        ];
+        for c in all_chords() {
+            for s in mac_chord_strokes(c).unwrap() {
+                assert!(!bad.contains(&s), "{c:?} plans a quit-capable stroke {s:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn layout_cache_keys_have_no_dead_or_duplicate_entries() {
+        use std::collections::HashSet;
+        let mut needed: HashSet<(char, bool)> = HashSet::new();
+        for c in all_chords() {
+            for s in mac_chord_strokes(c).unwrap() {
+                if let MacKey::Char(ch) = s.key {
+                    needed.insert((ch, s.mods.cmd));
+                }
+            }
+        }
+        let cached: HashSet<(char, bool)> = LAYOUT_CACHE_KEYS.iter().copied().collect();
+        assert_eq!(cached.len(), LAYOUT_CACHE_KEYS.len(), "duplicate LAYOUT_CACHE_KEYS entry");
+        assert_eq!(cached, needed, "LAYOUT_CACHE_KEYS must be exactly the Char strokes in use");
+    }
+
+    #[test]
+    fn resolve_stroke_codes_uses_lookup_for_char_keys() {
+        // AZERTY-like: 'a' is on physical 0x0C, 'k' stays on 0x28.
+        let table = |c: char, cmd: bool| match (c, cmd) {
+            ('a', true) => Some(0x0Cu16),
+            ('k', true) => Some(0x28),
+            _ => None,
+        };
+        let mut seen: Vec<(char, bool)> = Vec::new();
+        let clear = mac_chord_strokes(Chord::ClearInput).unwrap();
+        let codes = resolve_stroke_codes(&clear, |c, cmd| {
+            seen.push((c, cmd));
+            table(c, cmd)
+        })
+        .unwrap();
+        assert_eq!(codes, vec![0x0C, 0x33]);
+        assert_eq!(seen, vec![('a', true)]);
+
+        let k = mac_chord_strokes(Chord::CtrlK).unwrap();
+        assert_eq!(resolve_stroke_codes(&k, table).unwrap(), vec![0x28]);
+    }
+
+    #[test]
+    fn resolve_stroke_codes_physical_keys_never_call_lookup() {
+        let mut chords = vec![Chord::DeleteWord, Chord::Enter, Chord::NewChat];
+        chords.extend((1..=9).map(Chord::JumpChat));
+        for c in chords {
+            let strokes = mac_chord_strokes(c).unwrap();
+            let want: Vec<u16> = strokes
+                .iter()
+                .map(|s| match s.key {
+                    MacKey::Code(k) => k,
+                    MacKey::Char(_) => unreachable!("{c:?} must be all-physical"),
+                })
+                .collect();
+            let got = resolve_stroke_codes(&strokes, |ch, _| {
+                panic!("lookup called for {ch:?} in {c:?}")
+            })
+            .unwrap();
+            assert_eq!(got, want, "{c:?}");
+        }
+        // Spot-check against the D4 keycodes.
+        let d = mac_chord_strokes(Chord::DeleteWord).unwrap();
+        assert_eq!(resolve_stroke_codes(&d, |_, _| None).unwrap(), vec![0x33]);
+        let n = mac_chord_strokes(Chord::NewChat).unwrap();
+        assert_eq!(resolve_stroke_codes(&n, |_, _| None).unwrap(), vec![0x2D]);
+        let j = mac_chord_strokes(Chord::JumpChat(5)).unwrap();
+        assert_eq!(resolve_stroke_codes(&j, |_, _| None).unwrap(), vec![0x17]);
+    }
+
+    #[test]
+    fn resolve_stroke_codes_fails_closed_on_miss() {
+        let k = mac_chord_strokes(Chord::CtrlK).unwrap();
+        assert_eq!(
+            resolve_stroke_codes(&k, |_, _| None).unwrap_err(),
+            "keyboard layout key 'k' not resolved yet — nothing injected (open the Companion window once)"
+        );
+        let clear = mac_chord_strokes(Chord::ClearInput).unwrap();
+        let err = resolve_stroke_codes(&clear, |_, _| None).unwrap_err();
+        assert!(err.contains("'a'"), "{err}");
+        // The ANSI table has 'a', yet the result is Err: there is no fallback.
+        assert!(ansi_keycode_for_char('a').is_some());
+    }
+
+    #[test]
+    fn resolve_stroke_codes_partial_miss_names_missing_key() {
+        let mut strokes = mac_chord_strokes(Chord::ClearInput).unwrap();
+        strokes.extend(mac_chord_strokes(Chord::CtrlK).unwrap());
+        let err = resolve_stroke_codes(&strokes, |c, _| (c == 'a').then_some(0x0C)).unwrap_err();
+        assert!(err.contains("'k'"), "{err}");
+        assert!(!err.contains("'a'"), "{err}");
+    }
+
+    /// Deliberate source-grep gate (mac_sys is not compiled on Linux, so this is
+    /// the only Linux-side guard). It also fails on a *comment* that mentions
+    /// `dispatch_` or the ANSI char-to-keycode table, and that is intentional:
+    /// reword the comment rather than this test.
+    #[test]
+    fn runtime_sources_never_use_ansi_table_or_dispatch() {
+        let ansi = concat!("ansi_keycode", "_for_char");
+        let dispatch = concat!("dispatch", "_");
+        let mac_sys = include_str!("mac_sys.rs");
+        for (name, src) in [
+            ("mac_sys.rs", mac_sys),
+            ("kirocrew_control.rs", include_str!("kirocrew_control.rs")),
+            ("lib.rs", include_str!("lib.rs")),
+            ("inject.rs", include_str!("inject.rs")),
+        ] {
+            assert!(!src.contains(ansi), "{name} must not use the ANSI table at runtime");
+        }
+        assert!(!mac_sys.contains(dispatch), "mac_sys.rs must not use dispatch queues");
+        // Pins the pure-core wiring on a Linux host.
+        for call in ["resolve_stroke_codes(", "scan_window_pids(", "focused_window_matches("] {
+            assert!(mac_sys.contains(call), "mac_sys.rs must call {call}");
         }
     }
 
