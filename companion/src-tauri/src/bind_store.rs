@@ -59,6 +59,10 @@ pub struct BindStore {
     /// Optional Agent Status session pinned to the keyboard screen.
     #[serde(default)]
     pub pinned_session: String,
+    /// macOS dictation trigger wire name; empty = default (omitted from the
+    /// file so a Windows `binds.json` re-saves byte-identical).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mac_dictation_trigger: String,
 }
 
 impl Default for BindStore {
@@ -68,6 +72,7 @@ impl Default for BindStore {
             aliases: default_aliases(),
             sessions: default_sessions(),
             pinned_session: String::new(),
+            mac_dictation_trigger: String::new(),
         }
     }
 }
@@ -76,6 +81,12 @@ impl BindStore {
     /// A store with default chat numbers and no custom aliases.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set the macOS dictation trigger (U1 scaffold; U3 implements).
+    pub fn set_mac_dictation_trigger(&mut self, t: &str) {
+        let _ = t;
+        todo!("U3")
     }
 
     /// Ensure both vectors are exactly `SLOT_COUNT` long and all values are

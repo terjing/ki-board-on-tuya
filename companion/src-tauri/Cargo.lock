@@ -13,6 +13,8 @@ name = "agentic-keyboard-companion"
 version = "0.1.0"
 dependencies = [
  "btleplug",
+ "core-foundation",
+ "core-graphics",
  "dirs",
  "env_logger",
  "futures",

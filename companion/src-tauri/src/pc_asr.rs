@@ -69,8 +69,55 @@ pub trait PcAsrActivator: Send {
     fn is_available(&self) -> bool;
 }
 
-/// Construct the platform activator.
-pub fn activator() -> Box<dyn PcAsrActivator> {
+/// macOS dictation trigger (stored in `binds.json` as `mac_dictation_trigger`).
+/// U1 scaffold: `parse`/`as_str` are `todo!("U3")`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DictationTrigger {
+    #[default]
+    EditMenu,
+    DoubleControl,
+    DoubleRightCommand,
+    DoubleLeftCommand,
+}
+
+impl DictationTrigger {
+    pub fn parse(s: &str) -> Self {
+        let _ = s;
+        todo!("U3")
+    }
+
+    pub fn as_str(self) -> &'static str {
+        todo!("U3")
+    }
+}
+
+/// Classify an Edit-menu title as a dictation Start/Stop entry.
+pub fn dictation_menu_match(title: &str) -> Option<crate::keymap::DictationMenuItem> {
+    let _ = title;
+    todo!("U3")
+}
+
+/// `(modifier keycode, device flags)` for a double-tap trigger.
+pub fn double_tap_spec(t: DictationTrigger) -> Option<(u16, u64)> {
+    let _ = t;
+    todo!("U3")
+}
+
+/// Human label of the activation chord/trigger for the given host OS.
+pub fn activation_label_for(os: crate::platform::HostOs, t: DictationTrigger) -> String {
+    let _ = (os, t);
+    todo!("U3")
+}
+
+/// [`activation_label_for`] for the current host.
+pub fn activation_label(t: DictationTrigger) -> String {
+    activation_label_for(crate::platform::HostOs::current(), t)
+}
+
+/// Construct the platform activator. `trigger` and `target_pid` are consumed by
+/// the macOS backend (U3); Windows ignores them.
+pub fn activator(trigger: DictationTrigger, target_pid: Option<i32>) -> Box<dyn PcAsrActivator> {
+    let _ = (trigger, target_pid);
     #[cfg(windows)]
     {
         Box::new(windows_impl::WinHActivator)
@@ -232,7 +279,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn stub_activator_unavailable_and_ok() {
-        let a = activator();
+        let a = activator(DictationTrigger::default(), None);
         assert!(!a.is_available());
         assert!(a.activate().is_ok());
     }

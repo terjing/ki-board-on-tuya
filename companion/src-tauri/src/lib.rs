@@ -19,11 +19,15 @@ pub mod app_dirs;
 pub mod asr;
 pub mod diagnostics;
 pub mod inject;
+pub mod keymap;
 pub mod kirocrew_control;
 pub mod bind_store;
 pub mod crew_api;
 pub mod hook_install;
+#[cfg(target_os = "macos")]
+pub mod mac_sys;
 pub mod pc_asr;
+pub mod platform;
 pub mod protocol;
 pub mod status_sink;
 pub mod transport;
@@ -115,7 +119,7 @@ fn seq_suffix(seq: Option<u64>) -> String {
     }
 }
 
-#[cfg(any(test, target_os = "windows"))]
+#[cfg(any(test, target_os = "windows", target_os = "macos"))]
 fn ensure_usb_provisioning_transport(
     connected: bool,
     kind: transport::TransportKind,
@@ -187,21 +191,21 @@ pub fn inbound_to_json(frame: &Inbound) -> serde_json::Value {
     }
 }
 
-/// Launch the desktop application (Windows).
-#[cfg(target_os = "windows")]
+/// Launch the desktop application (Windows and macOS).
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub fn run() {
     app::run();
 }
 
 /// Keep the pure Rust core testable on the Linux build host without GTK/WebKit.
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn run() {
-    eprintln!("the Companion desktop application is supported on Windows");
+    eprintln!("the Companion desktop application is supported on Windows and macOS");
 }
 
-// ───────────────────────── Tauri application (Windows) ─────────────────────────
+// ───────────────────── Tauri application (Windows, macOS) ─────────────────────
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 mod app {
     use crate::diagnostics;
     use crate::crew_api::{
@@ -1812,7 +1816,7 @@ mod app {
                 if let Ok(mut inner) = state.inner.lock() {
                     let _ = inner.kc_controller.focus();
                 }
-                match pc_asr::activator().activate() {
+                match pc_asr::activator(pc_asr::DictationTrigger::default(), None).activate() {
                     Ok(()) => log_line(app, "[PC-ASR] focused window + activated OS dictation (Win+H)"),
                     Err(e) => log_line(app, format!("[PC-ASR] activate failed: {e}")),
                 }

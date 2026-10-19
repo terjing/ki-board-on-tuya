@@ -808,6 +808,13 @@ type Backend = windows_impl::WinController;
 #[cfg(not(windows))]
 type Backend = stub_impl::StubController;
 
+/// Window-title needles to try, in order, for a configured title match (U1
+/// scaffold; U2 implements).
+pub fn candidate_needles(title_match: &str) -> Vec<String> {
+    let _ = title_match;
+    todo!("U2")
+}
+
 /// The FP-4b controller: focus a local Kiro Crew window and inject text / the
 /// command bar / chords. Windows-backed for real; a compiling no-op/Err stub
 /// elsewhere. Construct with [`KiroCrewController::new`].
@@ -820,6 +827,12 @@ impl KiroCrewController {
     /// [`DEFAULT_TITLE_CANDIDATES`] ("Kiro Crew" / "Agentic").
     pub fn new(title_match: Option<String>) -> Self {
         Self { backend: Backend::new(title_match) }
+    }
+
+    /// PID of the window the last successful `focus()` resolved (macOS); `None`
+    /// elsewhere. U1 scaffold; U2 wires the macOS backend.
+    pub fn target_pid(&self) -> Option<i32> {
+        None
     }
 
     /// Re-configure the title substring to match (clears any cached handle).

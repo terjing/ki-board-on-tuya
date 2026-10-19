@@ -9,7 +9,7 @@ edition = "2021"
 name = "agentic_keyboard_companion_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
-[target.'cfg(target_os = "windows")'.build-dependencies]
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
@@ -49,8 +49,14 @@ dirs = "6"
 # the tree (reqwest/rustls dep), so pinning the direct dep churns nothing.
 getrandom = "0.2"
 
-[target.'cfg(target_os = "windows")'.dependencies]
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 tauri = { version = "2", features = [] }
+
+# macOS input injection + window focus. Already compiled into every macOS
+# Tauri build (tao depends on them); pinned to the Cargo.lock versions.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "=0.10.1"
+core-graphics = "=0.25.0"
 
 [dev-dependencies]
 env_logger = "0.11"
