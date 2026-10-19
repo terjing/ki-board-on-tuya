@@ -164,10 +164,10 @@ const CMD_KEY_STATE: u32 = 0x0100 >> 8;
 
 /// How long AX may block on one unresponsive application (plan D3).
 const AX_MESSAGING_TIMEOUT_SECS: f32 = 0.25;
-/// Frontmost poll after asking for activation (plan D3).
 /// Overall time budget for the `find_window` scan (each unresponsive app can
 /// cost one AX messaging timeout per read); an exhausted budget is a no-match.
 const FIND_WINDOW_BUDGET: Duration = Duration::from_secs(2);
+/// Frontmost poll after asking for activation (plan D3).
 const FRONTMOST_POLL: Duration = Duration::from_millis(200);
 const FRONTMOST_POLL_STEP: Duration = Duration::from_millis(10);
 const FOCUS_SETTLE: Duration = Duration::from_millis(40);
