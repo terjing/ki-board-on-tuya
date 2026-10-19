@@ -7,7 +7,9 @@
 //! (e.g. the Kiro composer). No API keys, no companion-side recognizer needed.
 //!
 //! Platform strategy mirrors `inject.rs` / `asr.rs`: a trait with a real
-//! `#[cfg(windows)]` `SendInput` impl and a non-Windows stub, so the Linux build
+//! `#[cfg(windows)]` `SendInput` impl, a `#[cfg(target_os = "macos")]` impl
+//! (Edit-menu "Start/Stop Dictation" or a double-tap modifier, see
+//! [`DictationTrigger`]) and a stub for every other host, so the Linux build
 //! stays crate-clean and the pure router below is unit-tested on any host.
 
 use crate::protocol::VoiceState;
@@ -31,7 +33,7 @@ impl VoiceSource {
     /// Parse the UI/board `voice_engine` string; unknown values fall back to Cloud.
     pub fn parse(s: &str) -> VoiceSource {
         match s.trim().to_ascii_lowercase().as_str() {
-            "system" | "pc" | "windows" => VoiceSource::System,
+            "system" | "pc" | "windows" | "mac" | "macos" => VoiceSource::System,
             _ => VoiceSource::Cloud,
         }
     }
@@ -70,7 +72,11 @@ pub trait PcAsrActivator: Send {
 }
 
 /// macOS dictation trigger (stored in `binds.json` as `mac_dictation_trigger`).
-/// U1 scaffold: `parse`/`as_str` are `todo!("U3")`.
+///
+/// `EditMenu` presses the target app's Edit ▸ Start/Stop Dictation menu item;
+/// the others post a double tap of a modifier key, which must match the shortcut
+/// chosen in System Settings ▸ Keyboard ▸ Dictation. Fn/🌐 is not offered:
+/// it is handled below the CGEvent layer.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum DictationTrigger {
     #[default]
@@ -81,32 +87,76 @@ pub enum DictationTrigger {
 }
 
 impl DictationTrigger {
+    /// Parse a wire name (trimmed, case-insensitive). Unknown or empty values
+    /// fall back to [`DictationTrigger::EditMenu`].
     pub fn parse(s: &str) -> Self {
-        let _ = s;
-        todo!("U3")
+        match s.trim().to_ascii_lowercase().as_str() {
+            "double-control" => DictationTrigger::DoubleControl,
+            "double-right-command" => DictationTrigger::DoubleRightCommand,
+            "double-left-command" => DictationTrigger::DoubleLeftCommand,
+            _ => DictationTrigger::EditMenu,
+        }
     }
 
+    /// The canonical wire name; `parse(t.as_str()) == t`.
     pub fn as_str(self) -> &'static str {
-        todo!("U3")
+        match self {
+            DictationTrigger::EditMenu => "edit-menu",
+            DictationTrigger::DoubleControl => "double-control",
+            DictationTrigger::DoubleRightCommand => "double-right-command",
+            DictationTrigger::DoubleLeftCommand => "double-left-command",
+        }
     }
 }
 
 /// Classify an Edit-menu title as a dictation Start/Stop entry.
+///
+/// The title is trimmed, lowercased and stripped of one trailing `…` / `...`.
+/// "Start Dictation" / "开始听写" is `Start`, "Stop Dictation" / "停止听写" is
+/// `Stop`; any other title containing "dictation" / "听写" counts as `Start`
+/// (localized variants). Everything else is `None`.
 pub fn dictation_menu_match(title: &str) -> Option<crate::keymap::DictationMenuItem> {
-    let _ = title;
-    todo!("U3")
+    use crate::keymap::DictationMenuItem;
+    let lower = title.trim().to_lowercase();
+    let t = lower
+        .strip_suffix('\u{2026}')
+        .or_else(|| lower.strip_suffix("..."))
+        .unwrap_or(&lower)
+        .trim();
+    if t.starts_with("stop dictation") || t.starts_with("停止听写") {
+        Some(DictationMenuItem::Stop)
+    } else if t.starts_with("start dictation") || t.starts_with("开始听写") {
+        Some(DictationMenuItem::Start)
+    } else if t.contains("dictation") || t.contains("听写") {
+        Some(DictationMenuItem::Start)
+    } else {
+        None
+    }
 }
 
-/// `(modifier keycode, device flags)` for a double-tap trigger.
+/// `(modifier keycode, device-dependent flags)` for a double-tap trigger; the
+/// flags are the CGEvent modifier mask OR'd with the left/right device bit.
+/// `EditMenu` has no double-tap form.
 pub fn double_tap_spec(t: DictationTrigger) -> Option<(u16, u64)> {
-    let _ = t;
-    todo!("U3")
+    match t {
+        DictationTrigger::EditMenu => None,
+        // kVK_Control, kCGEventFlagMaskControl | NX_DEVICELCTLKEYMASK
+        DictationTrigger::DoubleControl => Some((0x3B, 0x40000 | 0x1)),
+        // kVK_RightCommand, kCGEventFlagMaskCommand | NX_DEVICERCMDKEYMASK
+        DictationTrigger::DoubleRightCommand => Some((0x36, 0x100000 | 0x10)),
+        // kVK_Command, kCGEventFlagMaskCommand | NX_DEVICELCMDKEYMASK
+        DictationTrigger::DoubleLeftCommand => Some((0x37, 0x100000 | 0x08)),
+    }
 }
 
 /// Human label of the activation chord/trigger for the given host OS.
 pub fn activation_label_for(os: crate::platform::HostOs, t: DictationTrigger) -> String {
-    let _ = (os, t);
-    todo!("U3")
+    use crate::platform::HostOs;
+    match os {
+        HostOs::Windows => "Win+H".to_string(),
+        HostOs::Macos => format!("macOS Dictation ({})", t.as_str()),
+        HostOs::Other => "unsupported".to_string(),
+    }
 }
 
 /// [`activation_label_for`] for the current host.
@@ -114,18 +164,55 @@ pub fn activation_label(t: DictationTrigger) -> String {
     activation_label_for(crate::platform::HostOs::current(), t)
 }
 
-/// Construct the platform activator. `trigger` and `target_pid` are consumed by
-/// the macOS backend (U3); Windows ignores them.
+/// Construct the platform activator. `trigger` and `target_pid` (the PID the
+/// last successful Kiro Crew `focus()` resolved) are consumed by the macOS
+/// backend; Windows and the stub ignore them.
 pub fn activator(trigger: DictationTrigger, target_pid: Option<i32>) -> Box<dyn PcAsrActivator> {
     let _ = (trigger, target_pid);
     #[cfg(windows)]
     {
         Box::new(windows_impl::WinHActivator)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(macos_impl::MacDictationActivator {
+            trigger,
+            pid: target_pid,
+        })
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         Box::new(stub::StubActivator)
     }
+}
+
+/// What the macOS activator will do for a (trigger, target PID) pair. Pure, so
+/// the refusal rules are unit-tested on any host.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+enum MacPlan {
+    /// Press the target app's Edit-menu Start/Stop Dictation item.
+    EditMenu(i32),
+    /// Post a double tap of `(modifier keycode, flags)`.
+    DoubleTap(u16, u64),
+}
+
+/// Decide the macOS activation. Dictation must never start without a resolved
+/// Kiro Crew PID, and never against the Companion itself.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn plan_mac_activation(
+    trigger: DictationTrigger,
+    pid: Option<i32>,
+    own_pid: i32,
+) -> Result<MacPlan, String> {
+    let pid = pid.ok_or_else(|| "Kiro Crew window not found — dictation not started".to_string())?;
+    if pid == own_pid {
+        return Err("refusing to start dictation in the Companion's own window".to_string());
+    }
+    Ok(match double_tap_spec(trigger) {
+        None => MacPlan::EditMenu(pid),
+        Some((keycode, flags)) => MacPlan::DoubleTap(keycode, flags),
+    })
 }
 
 // ───────────────────────────── Windows ─────────────────────────────
@@ -209,9 +296,53 @@ mod windows_impl {
     }
 }
 
-// ─────────────────────────── Non-Windows ───────────────────────────
+// ───────────────────────────── macOS ─────────────────────────────
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod macos_impl {
+    use super::{dictation_menu_match, plan_mac_activation, DictationTrigger, MacPlan, PcAsrActivator};
+    use crate::keymap::DictationMenuItem;
+
+    /// Starts/stops macOS Dictation in the Kiro Crew window the controller
+    /// last focused (`pid`). It never targets the frontmost app by guess.
+    pub struct MacDictationActivator {
+        pub trigger: DictationTrigger,
+        pub pid: Option<i32>,
+    }
+
+    impl PcAsrActivator for MacDictationActivator {
+        fn activate(&self) -> Result<(), String> {
+            let plan = plan_mac_activation(self.trigger, self.pid, std::process::id() as i32)?;
+            if !crate::mac_sys::input_permission_granted() {
+                return Err("Accessibility permission not granted — dictation not started".to_string());
+            }
+            match plan {
+                MacPlan::EditMenu(pid) => {
+                    // Prefer "Stop" when present: toggle behaviour like Win+H.
+                    crate::mac_sys::press_menu_item(pid, dictation_menu_match, DictationMenuItem::Stop)
+                        .map(|_| ())
+                        .map_err(|e| {
+                            format!(
+                                "{e} — if the app has no Dictation menu item, \
+                                 switch the dictation trigger to a double-tap key"
+                            )
+                        })
+                }
+                MacPlan::DoubleTap(keycode, flags) => {
+                    crate::mac_sys::double_tap_modifier(keycode, flags)
+                }
+            }
+        }
+
+        fn is_available(&self) -> bool {
+            crate::mac_sys::input_permission_granted()
+        }
+    }
+}
+
+// ─────────────────────────── Other hosts ───────────────────────────
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod stub {
     use super::PcAsrActivator;
 
@@ -219,7 +350,7 @@ mod stub {
 
     impl PcAsrActivator for StubActivator {
         fn activate(&self) -> Result<(), String> {
-            eprintln!("pc_asr: OS dictation activation unsupported on this host (Windows-only)");
+            eprintln!("pc_asr: OS dictation activation unsupported on this host (Windows/macOS only)");
             Ok(())
         }
 
@@ -276,7 +407,98 @@ mod tests {
         assert_eq!(VoiceSource::Cloud.as_str(), "cloud");
     }
 
-    #[cfg(not(windows))]
+    #[test]
+    fn source_parse_accepts_mac_aliases() {
+        assert_eq!(VoiceSource::parse("mac"), VoiceSource::System);
+        assert_eq!(VoiceSource::parse(" macOS "), VoiceSource::System);
+    }
+
+    #[test]
+    fn trigger_parse_as_str_roundtrip() {
+        for t in [
+            DictationTrigger::EditMenu,
+            DictationTrigger::DoubleControl,
+            DictationTrigger::DoubleRightCommand,
+            DictationTrigger::DoubleLeftCommand,
+        ] {
+            assert_eq!(DictationTrigger::parse(t.as_str()), t);
+        }
+        assert_eq!(DictationTrigger::EditMenu.as_str(), "edit-menu");
+        assert_eq!(DictationTrigger::DoubleControl.as_str(), "double-control");
+        assert_eq!(DictationTrigger::DoubleRightCommand.as_str(), "double-right-command");
+        assert_eq!(DictationTrigger::DoubleLeftCommand.as_str(), "double-left-command");
+        assert_eq!(DictationTrigger::parse(" Double-Control "), DictationTrigger::DoubleControl);
+        assert_eq!(DictationTrigger::parse(""), DictationTrigger::EditMenu);
+        assert_eq!(DictationTrigger::parse("bogus"), DictationTrigger::EditMenu);
+        assert_eq!(DictationTrigger::default(), DictationTrigger::EditMenu);
+    }
+
+    #[test]
+    fn dictation_menu_match_classifies_titles() {
+        use crate::keymap::DictationMenuItem::{Start, Stop};
+        for t in ["Start Dictation\u{2026}", "Start Dictation...", "start dictation", "  Start Dictation  ", "开始听写…", "开始听写"] {
+            assert_eq!(dictation_menu_match(t), Some(Start), "{t:?}");
+        }
+        for t in ["Stop Dictation", "Stop Dictation\u{2026}", "停止听写", "停止听写…"] {
+            assert_eq!(dictation_menu_match(t), Some(Stop), "{t:?}");
+        }
+        // Localized/variant titles that merely mention dictation count as Start.
+        assert_eq!(dictation_menu_match("Démarrer la dictation"), Some(Start));
+        assert_eq!(dictation_menu_match("听写"), Some(Start));
+        assert_eq!(dictation_menu_match("Emoji & Symbols"), None);
+        assert_eq!(dictation_menu_match(""), None);
+    }
+
+    #[test]
+    fn double_tap_spec_values() {
+        assert_eq!(double_tap_spec(DictationTrigger::EditMenu), None);
+        assert_eq!(double_tap_spec(DictationTrigger::DoubleControl), Some((0x3B, 0x40001)));
+        assert_eq!(double_tap_spec(DictationTrigger::DoubleRightCommand), Some((0x36, 0x100010)));
+        assert_eq!(double_tap_spec(DictationTrigger::DoubleLeftCommand), Some((0x37, 0x100008)));
+    }
+
+    #[test]
+    fn activation_labels() {
+        use crate::platform::HostOs;
+        assert_eq!(activation_label_for(HostOs::Windows, DictationTrigger::default()), "Win+H");
+        assert_eq!(activation_label_for(HostOs::Windows, DictationTrigger::DoubleControl), "Win+H");
+        assert_eq!(
+            activation_label_for(HostOs::Macos, DictationTrigger::EditMenu),
+            "macOS Dictation (edit-menu)"
+        );
+        assert_eq!(
+            activation_label_for(HostOs::Macos, DictationTrigger::DoubleRightCommand),
+            "macOS Dictation (double-right-command)"
+        );
+        assert_eq!(activation_label_for(HostOs::Other, DictationTrigger::EditMenu), "unsupported");
+    }
+
+    #[test]
+    fn mac_plan_requires_pid_and_refuses_own_pid() {
+        let own = 4242;
+        for t in [
+            DictationTrigger::EditMenu,
+            DictationTrigger::DoubleControl,
+            DictationTrigger::DoubleRightCommand,
+            DictationTrigger::DoubleLeftCommand,
+        ] {
+            assert_eq!(
+                plan_mac_activation(t, None, own),
+                Err("Kiro Crew window not found — dictation not started".to_string())
+            );
+            assert!(plan_mac_activation(t, Some(own), own).is_err());
+        }
+        assert_eq!(
+            plan_mac_activation(DictationTrigger::EditMenu, Some(7), own),
+            Ok(MacPlan::EditMenu(7))
+        );
+        assert_eq!(
+            plan_mac_activation(DictationTrigger::DoubleLeftCommand, Some(7), own),
+            Ok(MacPlan::DoubleTap(0x37, 0x100008))
+        );
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
     fn stub_activator_unavailable_and_ok() {
         let a = activator(DictationTrigger::default(), None);
