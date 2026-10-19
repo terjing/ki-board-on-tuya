@@ -58,9 +58,38 @@ pub fn hook_file() -> Option<PathBuf> {
     hooks_dir().map(|dir| dir.join(HOOK_FILE_NAME))
 }
 
+/// Which shell family Kiro Crew uses to run hook commands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HookShell {
+    Windows,
+    Posix,
+}
+
+impl HookShell {
+    pub fn current() -> HookShell {
+        if cfg!(windows) {
+            HookShell::Windows
+        } else {
+            HookShell::Posix
+        }
+    }
+}
+
 /// Quote the executable so paths with spaces survive Crew's platform shell.
+/// Windows: `"<exe>" --hook`. POSIX (`/bin/sh -c`): `'<exe>' --hook` with each
+/// embedded `'` written as `'\''`.
+pub fn hook_command_for(shell: HookShell, companion_exe: &str) -> String {
+    match shell {
+        HookShell::Windows => format!("\"{companion_exe}\" {HOOK_MARKER}"),
+        HookShell::Posix => {
+            let quoted = companion_exe.replace('\'', "'\\''");
+            format!("'{quoted}' {HOOK_MARKER}")
+        }
+    }
+}
+
 pub fn hook_command(companion_exe: &str) -> String {
-    format!("\"{companion_exe}\" {HOOK_MARKER}")
+    hook_command_for(HookShell::current(), companion_exe)
 }
 
 pub fn current_exe_path() -> String {
@@ -269,7 +298,10 @@ mod tests {
     use super::*;
 
     fn command() -> String {
-        hook_command("C:\\Program Files\\AK Companion\\companion.exe")
+        hook_command_for(
+            HookShell::Windows,
+            "C:\\Program Files\\AK Companion\\companion.exe",
+        )
     }
 
     #[test]
@@ -278,6 +310,42 @@ mod tests {
             command(),
             "\"C:\\Program Files\\AK Companion\\companion.exe\" --hook"
         );
+    }
+
+    #[test]
+    fn posix_hook_command_single_quotes_app_bundle_path_with_spaces() {
+        assert_eq!(
+            hook_command_for(
+                HookShell::Posix,
+                "/Applications/Agentic Keyboard Companion.app/Contents/MacOS/companion"
+            ),
+            "'/Applications/Agentic Keyboard Companion.app/Contents/MacOS/companion' --hook"
+        );
+    }
+
+    #[test]
+    fn posix_hook_command_escapes_embedded_single_quote() {
+        assert_eq!(
+            hook_command_for(HookShell::Posix, "/Users/it's/companion"),
+            "'/Users/it'\\''s/companion' --hook"
+        );
+    }
+
+    #[test]
+    fn hook_command_uses_current_shell() {
+        let exe = "/opt/companion";
+        assert_eq!(
+            hook_command(exe),
+            hook_command_for(HookShell::current(), exe)
+        );
+    }
+
+    #[test]
+    fn posix_apply_install_counts_four_events() {
+        let cmd = hook_command_for(HookShell::Posix, "/Applications/AK Companion.app/x");
+        let mut config = json!({ "hooks": [] });
+        assert!(apply_install(&mut config, &cmd).unwrap());
+        assert_eq!(count_installed(&config, &cmd), 4);
     }
 
     #[test]
