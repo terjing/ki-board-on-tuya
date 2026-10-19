@@ -1,5 +1,7 @@
-// Prevents an extra console window on Windows in release builds.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Prevents an extra console window on Windows in release builds. The companion
+// is now macOS-native, but keep this attribute harmless on any Windows build by
+// gating it to the Windows target only (it is a no-op elsewhere).
+#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 use agentic_keyboard_companion_lib::{diagnostics, status_sink};
 

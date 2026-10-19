@@ -4,12 +4,18 @@
 //!
 //! Two layers live here:
 //!
-//! * [`KiroCrewController`] — Windows-gated `user32` FFI backend that finds the
-//!   Kiro Crew window by a configurable title substring, brings it to the
-//!   foreground, and injects text / the Ctrl+K command bar / named chords. It
-//!   reuses the raw `SendInput` pattern from [`crate::inject`] (no new crate).
-//!   On non-Windows hosts a stub compiles and returns `Err` / no-ops so the
+//! * [`KiroCrewController`] — macOS-gated backend that finds the Kiro Crew
+//!   window by a configurable title substring, brings it to the foreground
+//!   (via AppleScript / System Events through `osascript`), and injects text /
+//!   the command bar (Cmd+K) / named chords. Key injection reuses the raw
+//!   CoreGraphics / ApplicationServices FFI pattern from [`crate::inject`]
+//!   (`CGEventCreateKeyboardEvent` + `CGEventPost`), so no new crate is pulled
+//!   in. On non-macOS hosts a stub compiles and returns `Err` / no-ops so the
 //!   Linux CI build and the pure router tests below still work.
+//!
+//!   Runtime note: the macOS backend requires both **Accessibility** (to post
+//!   synthetic key events) and **Automation** permission (so `osascript` may
+//!   drive System Events) in System Settings > Privacy & Security.
 //!
 //! * [`ControlRouter`] / [`route_input`] — a **pure**, IO-free mapping from a
 //!   decoded board [`Inbound`] event to a [`ControlAction`]. Table-driven and
@@ -22,7 +28,12 @@ use crate::protocol::{Inbound, KeyAction, NavDir};
 // ───────────────────────────── Chord ─────────────────────────────
 
 /// A named key / key-combination the controller can inject. Kept small and
-/// `Copy` so the pure router can hand one to the (Windows) backend by value.
+/// `Copy` so the pure router can hand one to the (macOS) backend by value.
+///
+/// The variant names are platform-neutral; the actual macOS modifier used for
+/// each is defined in the `macos_impl` chord table (Cmd / Option / Shift). The
+/// `CtrlK` variant name is historical (it was Ctrl+K on Windows); on macOS it
+/// maps to **Cmd+K**.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Chord {
     Enter,
@@ -33,22 +44,22 @@ pub enum Chord {
     Right,
     /// Backspace — delete the character before the composer caret.
     Backspace,
-    /// Ctrl+Backspace — delete the word before the composer caret.
+    /// Delete the word before the composer caret. macOS: Option+Backspace.
     DeleteWord,
-    /// Ctrl+A, Backspace — clear the current composer sentence.
+    /// Clear the current composer sentence. macOS: Cmd+A, then Backspace.
     ClearInput,
-    /// Ctrl+K — open the Kiro Crew command bar.
+    /// Open the Kiro Crew command bar. macOS: Cmd+K (name is historical).
     CtrlK,
-    /// Alt+N — jump to chat N (N = 1..=9). Deterministic, unlike a command-bar
-    /// text search. (Kiro Crew default shortcut "Jump to chat N".)
+    /// Jump to chat N (N = 1..=9). Deterministic, unlike a command-bar text
+    /// search. macOS: Cmd+N digit ("Jump to chat N").
     JumpChat(u8),
-    /// Alt+Left — previous chat.
+    /// Previous chat. macOS: Cmd+Shift+[ (the macOS "previous tab" convention).
     PrevChat,
-    /// Alt+Right — next chat.
+    /// Next chat. macOS: Cmd+Shift+] (the macOS "next tab" convention).
     NextChat,
-    /// Alt+Enter — focus the chat text input (composer).
+    /// Focus the chat text input (composer). macOS: Cmd+Return.
     FocusInput,
-    /// Alt+Shift+N — new chat.
+    /// New chat. macOS: Cmd+N.
     NewChat,
 }
 
@@ -89,19 +100,20 @@ impl Chord {
 // ─────────────────────── Pure ControlRouter (T2) ───────────────────────
 
 /// The action the router decided a board event should produce. Consumed by the
-/// (Windows) [`KiroCrewController`]; pure and IO-free so it is fully testable.
+/// (macOS) [`KiroCrewController`]; pure and IO-free so it is fully testable.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControlAction {
-    /// Open the command bar (Ctrl+K), type the string, press Enter.
+    /// Open the command bar (Cmd+K on macOS), type the string, press Enter.
     CommandBar(String),
     /// Inject a single named chord.
     Chord(Chord),
     /// Type free text into the focused input (no command bar, no Enter).
     SendText(String),
-    /// Focus the chat composer (Alt+Enter), then type the text — no Enter, so
-    /// the user reviews and submits with K5. This is the K4 voice path.
+    /// Focus the chat composer, then type the text — no Enter, so the user
+    /// reviews and submits with K5. This is the K4 voice path.
     Compose(String),
-    /// Start repeating Ctrl+Backspace while joystick-left remains held.
+    /// Start repeating the DeleteWord chord (Option+Backspace on macOS) while
+    /// joystick-left remains held.
     StartDeleteWords,
     /// Stop a previously started continuous word deletion.
     StopDeleteWords,
@@ -111,7 +123,8 @@ pub enum ControlAction {
 
 /// Router context — the small amount of state the pure mapping needs but does
 /// not own. `jump_chats[i]` is the chat NUMBER (1..=9) that K(i+1) (K1..K3)
-/// jumps to via the deterministic `Alt+N` shortcut. Defaults to `[1, 2, 3]`.
+/// jumps to via the deterministic jump-to-chat shortcut (Cmd+N on macOS).
+/// Defaults to `[1, 2, 3]`.
 /// The number for each key is user-configurable (persisted in the bind store)
 /// and kept in sync here by `lib.rs`.
 #[derive(Clone, Debug, Default)]
@@ -121,12 +134,12 @@ pub struct ControlCtx {
 }
 
 impl ControlCtx {
-    /// Sensible defaults: K1->chat 1, K2->chat 2, K3->chat 3 (Alt+1/2/3).
+    /// Sensible defaults: K1->chat 1, K2->chat 2, K3->chat 3 (Cmd+1/2/3).
     pub fn with_default_jumps() -> Self {
         Self { jump_chats: vec![1, 2, 3] }
     }
 
-    /// Deterministic `Alt+N` jump for slot `idx` (0-based). Returns
+    /// Deterministic jump-to-chat for slot `idx` (0-based). Returns
     /// `Chord(JumpChat(n))` when `jump_chats[idx]` is a valid chat number
     /// (1..=9); `None` when the index is missing or the number is out of range.
     fn jump(&self, idx: usize) -> ControlAction {
@@ -153,16 +166,16 @@ const BOARD_LONG_PRESS_MS: u32 = 800;
 /// | event                          | action                              |
 /// |--------------------------------|-------------------------------------|
 /// | `macro { name }` (recognized text) | `Compose(name)` — K4 voice → focus composer + type (no send) |
-/// | `key k1..k3` `Click`           | `Chord(JumpChat(n))` — n = configured `jump_chats[idx]` (Alt+N, client-side jump to chat n); `None` if unset / out of 1..=9 |
+/// | `key k1..k3` `Click`           | `Chord(JumpChat(n))` — n = configured `jump_chats[idx]` (Cmd+N on macOS, client-side jump to chat n); `None` if unset / out of 1..=9 |
 /// | `key k1..k3` `Down`/`Long`/`Up`/`Dclick` | `None` — jump fires only on `Click`; `Long` is reserved for long-press auto-bind |
 /// | `key k4` (down/long)           | `None` — K4 is push-to-talk; text arrives later as `macro` |
 /// | `key k5` (down/long)           | `Chord(Enter)` — submit / continue  |
 /// | `nav left` `Up` (< 800 ms)  | `Chord(Backspace)` — delete one character |
-/// | `nav left` `Long`           | `StartDeleteWords` — repeat Ctrl+Backspace |
+/// | `nav left` `Long`           | `StartDeleteWords` — repeat Option+Backspace |
 /// | `nav left` `Up` (>= 800 ms) | `StopDeleteWords` — stop repeat            |
 /// | `nav up` `Up` (< 800 ms)    | `Chord(Up)` — move to previous line      |
-/// | `nav up` `Long`             | `Chord(ClearInput)` — Ctrl+A, Backspace  |
-/// | `nav right` `Down`          | `Chord(NextChat)` — Alt+Right            |
+/// | `nav up` `Long`             | `Chord(ClearInput)` — Cmd+A, Backspace   |
+/// | `nav right` `Down`          | `Chord(NextChat)` — next chat (Cmd+Shift+]) |
 /// | `nav down` `Down`           | `Chord(Down)` — arrow key                |
 /// | `nav center` `Down`         | `Chord(Enter)`                            |
 /// | anything else / key `up`    | `None`                                    |
@@ -272,12 +285,13 @@ impl ControlRouter {
 /// Default window-title substrings tried in order when none is configured.
 pub const DEFAULT_TITLE_CANDIDATES: &[&str] = &["Kiro Crew", "Agentic"];
 
-// ============================== Windows ==============================
+// =============================== macOS ===============================
 
-#[cfg(windows)]
-mod windows_impl {
+#[cfg(target_os = "macos")]
+mod macos_impl {
     use super::{Chord, DEFAULT_TITLE_CANDIDATES};
-    use std::mem::size_of;
+    use std::os::raw::c_void;
+    use std::process::Command;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -285,213 +299,173 @@ mod windows_impl {
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
-    // --- Minimal Win32 bindings (raw FFI, mirrors inject.rs — no `windows` crate). ---
-    type HWND = isize;
-    type LPARAM = isize;
-    type BOOL = i32;
-    type WPARAM = usize;
+    // ── macOS virtual keycodes (ANSI, from <HIToolbox/Events.h>) ──
+    //
+    // These are the hardware keycodes CoreGraphics expects, NOT ASCII. The
+    // digit keycodes are intentionally out of numeric order (that is the real
+    // ANSI layout order).
+    const VK_RETURN: u16 = 0x24; // kVK_Return
+    const VK_ESCAPE: u16 = 0x35; // kVK_Escape
+    const VK_UP: u16 = 0x7E; // kVK_UpArrow
+    const VK_DOWN: u16 = 0x7D; // kVK_DownArrow
+    const VK_LEFT: u16 = 0x7B; // kVK_LeftArrow
+    const VK_RIGHT: u16 = 0x7C; // kVK_RightArrow
+    const VK_DELETE: u16 = 0x33; // kVK_Delete (Backspace)
+    const VK_A: u16 = 0x00; // kVK_ANSI_A
+    const VK_K: u16 = 0x28; // kVK_ANSI_K
+    const VK_N: u16 = 0x2D; // kVK_ANSI_N
+    const VK_LEFT_BRACKET: u16 = 0x21; // kVK_ANSI_LeftBracket  ('[')
+    const VK_RIGHT_BRACKET: u16 = 0x1E; // kVK_ANSI_RightBracket (']')
+    /// Keycodes for the digit keys '1'..'9', in digit order (index 0 == '1').
+    /// From <HIToolbox/Events.h>: kVK_ANSI_1..9 are NOT contiguous.
+    const VK_DIGIT: [u16; 9] = [
+        0x12, // '1'
+        0x13, // '2'
+        0x14, // '3'
+        0x15, // '4'
+        0x17, // '5'
+        0x16, // '6'
+        0x1A, // '7'
+        0x1C, // '8'
+        0x19, // '9'
+    ];
 
-    const INPUT_KEYBOARD: u32 = 1;
-    const KEYEVENTF_EXTENDEDKEY: u32 = 0x0001;
-    const KEYEVENTF_KEYUP: u32 = 0x0002;
-    const KEYEVENTF_UNICODE: u32 = 0x0004;
-    const KEYEVENTF_SCANCODE: u32 = 0x0008;
-    const MAPVK_VK_TO_VSC: u32 = 0;
+    // ── CGEventFlags modifier masks (from CoreGraphics CGEventTypes.h) ──
+    const FLAG_SHIFT: u64 = 1 << 17; // kCGEventFlagMaskShift
+    #[allow(dead_code)]
+    const FLAG_CONTROL: u64 = 1 << 18; // kCGEventFlagMaskControl
+    const FLAG_OPTION: u64 = 1 << 19; // kCGEventFlagMaskAlternate (Option/Alt)
+    const FLAG_COMMAND: u64 = 1 << 20; // kCGEventFlagMaskCommand (⌘)
 
-    // Virtual-key codes we use for chords / the command bar.
-    const VK_RETURN: u16 = 0x0D;
-    const VK_ESCAPE: u16 = 0x1B;
-    const VK_BACK: u16 = 0x08;
-    const VK_LEFT: u16 = 0x25;
-    const VK_UP: u16 = 0x26;
-    const VK_RIGHT: u16 = 0x27;
-    const VK_DOWN: u16 = 0x28;
-    const VK_CONTROL: u16 = 0x11;
-    const VK_MENU: u16 = 0x12; // Alt
-    const VK_SHIFT: u16 = 0x10;
-    const VK_A: u16 = 0x41; // 'A'
-    const VK_K: u16 = 0x4B; // 'K'
-    const VK_N: u16 = 0x4E; // 'N'
+    // `kCGHIDEventTap == 0`: post into the HID stream so the frontmost app sees
+    // the synthetic events as real hardware input.
+    const KCG_HID_EVENT_TAP: u32 = 0;
 
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct KEYBDINPUT {
-        w_vk: u16,
-        w_scan: u16,
-        dw_flags: u32,
-        time: u32,
-        dw_extra_info: usize,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct INPUT {
-        r#type: u32,
-        ki: KEYBDINPUT,
-        _pad: [u8; 8],
-    }
-
-    // EnumWindows callback signature.
-    type WNDENUMPROC = unsafe extern "system" fn(HWND, LPARAM) -> BOOL;
-
-    #[link(name = "user32")]
-    extern "system" {
-        fn SendInput(c_inputs: u32, p_inputs: *const INPUT, cb_size: i32) -> u32;
-        fn MapVirtualKeyW(u_code: u32, u_map_type: u32) -> u32;
-        fn EnumWindows(lp_enum_func: WNDENUMPROC, l_param: LPARAM) -> BOOL;
-        fn GetWindowTextW(hwnd: HWND, lp_string: *mut u16, n_max_count: i32) -> i32;
-        fn GetWindowTextLengthW(hwnd: HWND) -> i32;
-        fn IsWindowVisible(hwnd: HWND) -> BOOL;
-        fn SetForegroundWindow(hwnd: HWND) -> BOOL;
-        fn ShowWindow(hwnd: HWND, n_cmd_show: i32) -> BOOL;
-        fn IsIconic(hwnd: HWND) -> BOOL;
-        fn SendMessageW(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> isize;
-        fn GetForegroundWindow() -> HWND;
-        fn GetWindowThreadProcessId(hwnd: HWND, lp_process_id: *mut u32) -> u32;
-        fn AttachThreadInput(id_attach: u32, id_attach_to: u32, f_attach: BOOL) -> BOOL;
-        fn AllowSetForegroundWindow(dw_process_id: u32) -> BOOL;
-        fn BringWindowToTop(hwnd: HWND) -> BOOL;
-    }
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetCurrentThreadId() -> u32;
-    }
-
-    const SW_RESTORE: i32 = 9;
-    const SW_SHOW: i32 = 5;
-    // ASFW_ANY — allow any process to set the foreground window.
-    const ASFW_ANY: u32 = 0xFFFF_FFFF;
     const DELETE_REPEAT_INITIAL_DELAY: Duration = Duration::from_millis(280);
     const DELETE_REPEAT_INTERVAL: Duration = Duration::from_millis(120);
-    const DELETE_REPEAT_MAX_DURATION: Duration = Duration::from_secs(10);
+    // Hard cap on the continuous word-delete repeat. The Windows impl re-checked
+    // GetForegroundWindow every iteration and stopped the moment focus left the
+    // Kiro Crew window; the macOS impl has no cheap crate-free foreground check
+    // (adding one would mean a new crate / more FFI, which the offline build
+    // forbids), so this bound is the backstop that limits how long misdirected
+    // deletes could land if focus moves away while joystick-left is still held.
+    // Tightened from 10s to 4s to shrink that worst-case window: at the 120ms
+    // repeat interval 4s is ~33 word-deletes, far more than any realistic held
+    // sentence-clear, while the normal joystick-left release still stops the
+    // repeat immediately via the stop flag. See `start_delete_words`.
+    const DELETE_REPEAT_MAX_DURATION: Duration = Duration::from_secs(4);
 
-    // --- SendInput helpers (same shape as inject.rs). ---
-
-    fn send(inputs: &[INPUT]) -> Result<(), String> {
-        let sent = unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32) };
-        if sent as usize == inputs.len() {
-            Ok(())
-        } else {
-            Err(format!("SendInput injected {sent}/{} events", inputs.len()))
-        }
+    // Raw FFI into the ApplicationServices umbrella framework (CoreGraphics +
+    // CoreFoundation live under it), mirroring the raw FFI pattern in
+    // `crate::inject` — no `core-graphics`/`core-foundation` crate is added.
+    // The source/event pointers are opaque CF types, modeled as `*const c_void`.
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn CGEventCreateKeyboardEvent(
+            source: *const c_void,
+            keycode: u16,
+            keydown: bool,
+        ) -> *const c_void;
+        fn CGEventKeyboardSetUnicodeString(
+            event: *const c_void,
+            length: usize,
+            unicode_string: *const u16,
+        );
+        fn CGEventSetFlags(event: *const c_void, flags: u64);
+        fn CGEventPost(tap: u32, event: *const c_void);
+        fn CFRelease(cf: *const c_void);
     }
 
-    fn unicode_event(unit: u16, key_up: bool) -> INPUT {
-        let mut flags = KEYEVENTF_UNICODE;
-        if key_up {
-            flags |= KEYEVENTF_KEYUP;
-        }
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            ki: KEYBDINPUT { w_vk: 0, w_scan: unit, dw_flags: flags, time: 0, dw_extra_info: 0 },
-            _pad: [0; 8],
-        }
-    }
+    // ── Key injection helpers (CoreGraphics event posting). ──
 
-    /// Build a physical key event with a scan code whenever Windows can map the
-    /// virtual key. Kiro Crew routes chat shortcuts by `KeyboardEvent.code`
-    /// (`Digit1` … `Digit9`); Chromium/WebView cannot reliably derive that code
-    /// from a SendInput packet whose scan code is zero. Fall back to the virtual
-    /// key for the rare values MapVirtualKeyW cannot map.
-    fn vkey_event(vk: u16, key_up: bool) -> INPUT {
-        let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as u16;
-        let mut flags = if key_up { KEYEVENTF_KEYUP } else { 0 };
-        let extended = matches!(vk, VK_LEFT | VK_UP | VK_RIGHT | VK_DOWN);
-        let (w_vk, w_scan) = if scan != 0 {
-            flags |= KEYEVENTF_SCANCODE;
-            if extended {
-                flags |= KEYEVENTF_EXTENDEDKEY;
+    /// Create, post, and release one keyboard event (down or up) carrying the
+    /// given modifier `flags`. Returns Err on a null event pointer.
+    fn post_key(vk: u16, keydown: bool, flags: u64) -> Result<(), String> {
+        unsafe {
+            let event = CGEventCreateKeyboardEvent(std::ptr::null(), vk, keydown);
+            if event.is_null() {
+                return Err("CGEventCreateKeyboardEvent returned null".to_string());
             }
-            (0, scan)
-        } else {
-            (vk, 0)
-        };
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            ki: KEYBDINPUT {
-                w_vk,
-                w_scan,
-                dw_flags: flags,
-                time: 0,
-                dw_extra_info: 0,
-            },
-            _pad: [0; 8],
+            if flags != 0 {
+                CGEventSetFlags(event, flags);
+            }
+            CGEventPost(KCG_HID_EVENT_TAP, event);
+            CFRelease(event);
         }
+        Ok(())
     }
 
+    /// Tap `vk` with the given modifier flags: keydown then keyup, both carrying
+    /// the modifier mask (CoreGraphics attaches modifiers via the event flags,
+    /// so there is no separate modifier down/up event to synthesize).
+    fn chord_tap(vk: u16, flags: u64) -> Result<(), String> {
+        post_key(vk, true, flags)?;
+        post_key(vk, false, flags)
+    }
+
+    /// Plain tap (no modifiers).
+    fn tap(vk: u16) -> Result<(), String> {
+        chord_tap(vk, 0)
+    }
+
+    /// Type a UTF-8 string as Unicode via a keycode-0 event, mirroring
+    /// `inject.rs`'s `type_text`.
     fn type_text_raw(text: &str) -> Result<(), String> {
-        let mut events = Vec::with_capacity(text.len() * 2);
-        for unit in text.encode_utf16() {
-            events.push(unicode_event(unit, false));
-            events.push(unicode_event(unit, true));
-        }
-        if events.is_empty() {
+        if text.is_empty() {
             return Ok(());
         }
-        send(&events)
+        let units: Vec<u16> = text.encode_utf16().collect();
+        unsafe {
+            for &keydown in &[true, false] {
+                let event = CGEventCreateKeyboardEvent(std::ptr::null(), 0, keydown);
+                if event.is_null() {
+                    return Err("CGEventCreateKeyboardEvent returned null".to_string());
+                }
+                CGEventKeyboardSetUnicodeString(event, units.len(), units.as_ptr());
+                CGEventPost(KCG_HID_EVENT_TAP, event);
+                CFRelease(event);
+            }
+        }
+        Ok(())
     }
 
-    fn tap(vk: u16) -> Result<(), String> {
-        send(&[vkey_event(vk, false), vkey_event(vk, true)])
-    }
-
-    /// LCTRL + <vk> as one SendInput batch.
-    fn ctrl_tap(vk: u16) -> Result<(), String> {
-        send(&[
-            vkey_event(VK_CONTROL, false),
-            vkey_event(vk, false),
-            vkey_event(vk, true),
-            vkey_event(VK_CONTROL, true),
-        ])
-    }
-
-    /// Ctrl+A followed by Backspace clears the focused composer.
+    /// Cmd+A then Backspace clears the focused composer.
     fn clear_input() -> Result<(), String> {
-        send(&[
-            vkey_event(VK_CONTROL, false),
-            vkey_event(VK_A, false),
-            vkey_event(VK_A, true),
-            vkey_event(VK_CONTROL, true),
-            vkey_event(VK_BACK, false),
-            vkey_event(VK_BACK, true),
-        ])
+        chord_tap(VK_A, FLAG_COMMAND)?;
+        tap(VK_DELETE)
     }
 
-    /// LCTRL↓ K↓ K↑ LCTRL↑ — the command-bar hotkey.
-    fn ctrl_k() -> Result<(), String> {
-        send(&[
-            vkey_event(VK_CONTROL, false),
-            vkey_event(VK_K, false),
-            vkey_event(VK_K, true),
-            vkey_event(VK_CONTROL, true),
-        ])
+    /// Cmd+K — open the command bar.
+    fn command_bar_hotkey() -> Result<(), String> {
+        chord_tap(VK_K, FLAG_COMMAND)
     }
 
-    /// Alt + <vk> (Alt↓ vk↓ vk↑ Alt↑).
-    fn alt_tap(vk: u16) -> Result<(), String> {
-        send(&[
-            vkey_event(VK_MENU, false),
-            vkey_event(vk, false),
-            vkey_event(vk, true),
-            vkey_event(VK_MENU, true),
-        ])
-    }
-
-    /// Alt + Shift + <vk>.
-    fn alt_shift_tap(vk: u16) -> Result<(), String> {
-        send(&[
-            vkey_event(VK_MENU, false),
-            vkey_event(VK_SHIFT, false),
-            vkey_event(vk, false),
-            vkey_event(vk, true),
-            vkey_event(VK_SHIFT, true),
-            vkey_event(VK_MENU, true),
-        ])
-    }
-
-    /// Inject one chord. Simple chords tap a single VK; the Kiro Crew shortcuts
-    /// use Alt / Alt+Shift combos.
+    // ── macOS chord → (keycode, modifier flags) mapping table ──
+    //
+    // IMPORTANT: these macOS modifiers were chosen to follow the idiomatic
+    // Cmd/Option conventions of a macOS/Electron app, but research of Kiro
+    // Crew's ACTUAL macOS keybindings was NOT possible offline. If the real
+    // app binds different shortcuts on macOS, adjust the right-hand column of
+    // this table — it is the single place the backend decides modifiers.
+    //
+    //   Chord           macOS shortcut             (was on Windows)
+    //   ─────────────   ────────────────────────   ────────────────────
+    //   Enter           Return                     Return
+    //   Esc             Escape                     Escape
+    //   Up/Down/        arrow keys (no modifier)   arrow keys
+    //   Left/Right
+    //   Backspace       Delete (no modifier)       Backspace
+    //   DeleteWord      Option+Backspace           Ctrl+Backspace
+    //   ClearInput      Cmd+A then Backspace       Ctrl+A then Backspace
+    //   CtrlK           Cmd+K  (command bar)       Ctrl+K
+    //   JumpChat(n)     Cmd+<digit n>              Alt+<digit n>
+    //   PrevChat        Cmd+Shift+[  ("prev tab")  Alt+Left
+    //   NextChat        Cmd+Shift+]  ("next tab")  Alt+Right
+    //   FocusInput      Cmd+Return                 Alt+Enter
+    //   NewChat         Cmd+N                      Alt+Shift+N
+    //
+    // (PrevChat/NextChat use the macOS "previous/next tab" convention
+    // Cmd+Shift+[ / Cmd+Shift+]; change these if Kiro Crew uses arrows.)
     fn inject_chord(c: Chord) -> Result<(), String> {
         match c {
             Chord::Enter => tap(VK_RETURN),
@@ -500,60 +474,98 @@ mod windows_impl {
             Chord::Down => tap(VK_DOWN),
             Chord::Left => tap(VK_LEFT),
             Chord::Right => tap(VK_RIGHT),
-            Chord::Backspace => tap(VK_BACK),
-            Chord::DeleteWord => ctrl_tap(VK_BACK),
-            Chord::ClearInput => clear_input(),
-            Chord::CtrlK => ctrl_k(),
-            Chord::JumpChat(n) if (1..=9).contains(&n) => alt_tap(0x30 + n as u16), // Alt+'1'..'9'
+            Chord::Backspace => tap(VK_DELETE),
+            Chord::DeleteWord => chord_tap(VK_DELETE, FLAG_OPTION), // Option+Backspace
+            Chord::ClearInput => clear_input(),                     // Cmd+A, Backspace
+            Chord::CtrlK => command_bar_hotkey(),                   // Cmd+K
+            Chord::JumpChat(n) if (1..=9).contains(&n) => {
+                chord_tap(VK_DIGIT[(n - 1) as usize], FLAG_COMMAND) // Cmd+<digit>
+            }
             Chord::JumpChat(n) => Err(format!("JumpChat({n}) out of range 1..=9")),
-            Chord::PrevChat => alt_tap(VK_LEFT),  // Alt+Left
-            Chord::NextChat => alt_tap(VK_RIGHT), // Alt+Right
-            Chord::FocusInput => alt_tap(VK_RETURN), // Alt+Enter
-            Chord::NewChat => alt_shift_tap(VK_N),   // Alt+Shift+N
+            Chord::PrevChat => chord_tap(VK_LEFT_BRACKET, FLAG_COMMAND | FLAG_SHIFT), // Cmd+Shift+[
+            Chord::NextChat => chord_tap(VK_RIGHT_BRACKET, FLAG_COMMAND | FLAG_SHIFT), // Cmd+Shift+]
+            Chord::FocusInput => chord_tap(VK_RETURN, FLAG_COMMAND),                   // Cmd+Return
+            Chord::NewChat => chord_tap(VK_N, FLAG_COMMAND),                           // Cmd+N
         }
     }
 
-    // --- Window enumeration + focus. ---
+    // ── Window focus by title (AppleScript via /usr/bin/osascript). ──
+    //
+    // There is no CoreGraphics API to raise a window by title without a crate,
+    // so we shell out to `osascript` running a System Events script. The script
+    // finds the first application process that owns a window whose title (or the
+    // process name) contains the configured substring and `activate`s it,
+    // printing "AK_FOCUS_OK" on success. This requires macOS **Automation**
+    // permission (to drive System Events) and, together with key injection,
+    // **Accessibility** permission.
 
-    struct FindCtx {
-        needle_lower: String,
-        found: HWND,
+    /// True if `needle` contains any ASCII control character (newline, carriage
+    /// return, tab, NUL, etc.). An AppleScript double-quoted literal cannot span
+    /// a raw newline, so such a value would either break the script or let an
+    /// attacker-ish `title_match` append AppleScript lines. We reject these
+    /// up-front in [`try_focus`] (fail closed → treated as "no match") rather
+    /// than try to escape every control char; normal window titles never
+    /// contain control characters, so this does not change behavior for them.
+    fn has_control_chars(needle: &str) -> bool {
+        needle.chars().any(|c| c.is_control())
     }
 
-    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let ctx = &mut *(lparam as *mut FindCtx);
-        if IsWindowVisible(hwnd) == 0 {
-            return 1; // keep enumerating
-        }
-        let len = GetWindowTextLengthW(hwnd);
-        if len <= 0 {
-            return 1;
-        }
-        let mut buf = vec![0u16; (len as usize) + 1];
-        let copied = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
-        if copied <= 0 {
-            return 1;
-        }
-        let title = String::from_utf16_lossy(&buf[..copied as usize]);
-        if title.to_lowercase().contains(&ctx.needle_lower) {
-            ctx.found = hwnd;
-            return 0; // stop enumerating — first visible match wins
-        }
-        1
+    /// Build the AppleScript that activates the first app whose window title
+    /// (or process name) contains `needle` (case-insensitive — AppleScript's
+    /// `contains` is case-insensitive by default). `needle` is embedded as an
+    /// AppleScript string literal with quotes/backslashes escaped so an odd
+    /// title substring cannot break out of the script. Callers MUST reject
+    /// needles containing control chars first (see [`has_control_chars`]); a raw
+    /// newline cannot be represented in a double-quoted AppleScript literal.
+    fn focus_script(needle: &str) -> String {
+        let escaped = needle.replace('\\', "\\\\").replace('"', "\\\"");
+        format!(
+            "set needle to \"{escaped}\"\n\
+             tell application \"System Events\"\n\
+             \tset procs to (every application process whose background only is false)\n\
+             \trepeat with p in procs\n\
+             \t\ttry\n\
+             \t\t\tif (name of p) contains needle then\n\
+             \t\t\t\tset frontmost of p to true\n\
+             \t\t\t\treturn \"AK_FOCUS_OK\"\n\
+             \t\t\tend if\n\
+             \t\t\trepeat with w in (windows of p)\n\
+             \t\t\t\tif (name of w) contains needle then\n\
+             \t\t\t\t\tset frontmost of p to true\n\
+             \t\t\t\t\treturn \"AK_FOCUS_OK\"\n\
+             \t\t\t\tend if\n\
+             \t\t\tend repeat\n\
+             \t\tend try\n\
+             \tend repeat\n\
+             end tell\n\
+             return \"AK_FOCUS_NONE\""
+        )
     }
 
-    /// Find the first visible top-level window whose title contains `needle`
-    /// (case-insensitive). Returns `None` if none match.
-    fn find_window_by_title(needle: &str) -> Option<HWND> {
-        let mut ctx = FindCtx { needle_lower: needle.to_lowercase(), found: 0 };
-        unsafe {
-            EnumWindows(enum_proc, &mut ctx as *mut FindCtx as LPARAM);
+    /// Run the focus AppleScript for one `needle`; `Ok(true)` when a matching
+    /// app was activated, `Ok(false)` when none matched, `Err` on osascript
+    /// failure (e.g. missing Automation permission).
+    fn try_focus(needle: &str) -> Result<bool, String> {
+        // Fail closed on control characters (newlines/CR/tab/NUL/…): they
+        // cannot be embedded in a double-quoted AppleScript literal and could
+        // otherwise inject script lines. Treat such a needle as "no match" so
+        // focus() moves on to the next candidate / returns the normal "no
+        // window matches" Err — injecting nothing.
+        if has_control_chars(needle) {
+            return Ok(false);
         }
-        if ctx.found != 0 {
-            Some(ctx.found)
-        } else {
-            None
+        let out = Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(focus_script(needle))
+            .output()
+            .map_err(|e| format!("control: osascript spawn failed: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "control: osascript failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
         }
+        Ok(String::from_utf8_lossy(&out.stdout).contains("AK_FOCUS_OK"))
     }
 
     struct DeleteRepeat {
@@ -561,17 +573,16 @@ mod windows_impl {
         worker: JoinHandle<()>,
     }
 
-    /// Windows controller: focuses a Kiro Crew window then injects.
-    pub struct WinController {
-        hwnd: Option<HWND>,
+    /// macOS controller: focuses a Kiro Crew window (via AppleScript) then
+    /// injects keystrokes (via CoreGraphics).
+    pub struct MacController {
         title_match: String,
         delete_repeat: Option<DeleteRepeat>,
     }
 
-    impl WinController {
+    impl MacController {
         pub fn new(title_match: Option<String>) -> Self {
             Self {
-                hwnd: None,
                 title_match: title_match.unwrap_or_default(),
                 delete_repeat: None,
             }
@@ -579,11 +590,11 @@ mod windows_impl {
 
         pub fn set_title_match(&mut self, title: String) {
             self.title_match = title;
-            self.hwnd = None; // force re-resolve on next focus
         }
 
-        /// Resolve + foreground the Kiro Crew window. Verifies a match BEFORE any
-        /// injection (AC1.5); returns `Err` and injects nothing if none found.
+        /// Resolve + foreground the Kiro Crew window. Verifies a match BEFORE
+        /// any injection (AC1.5, mirroring the Windows contract); returns `Err`
+        /// and injects nothing if no matching window/app is found.
         pub fn focus(&mut self) -> Result<(), String> {
             // Candidate list: the configured substring first, else the defaults.
             let candidates: Vec<String> = if self.title_match.trim().is_empty() {
@@ -592,67 +603,29 @@ mod windows_impl {
                 vec![self.title_match.clone()]
             };
 
-            let hwnd = candidates
-                .iter()
-                .find_map(|needle| find_window_by_title(needle))
-                .ok_or_else(|| {
-                    format!(
-                        "control: no window matches title {:?} (nothing injected)",
-                        if self.title_match.trim().is_empty() {
-                            DEFAULT_TITLE_CANDIDATES.join(" / ")
-                        } else {
-                            self.title_match.clone()
-                        }
-                    )
-                })?;
-
-            // Force the target to the foreground. A bare SetForegroundWindow is
-            // refused by Windows' focus-stealing rules when our process is not the
-            // current foreground owner, so the injected keys would land in whatever
-            // window is actually focused. The reliable path is to attach OUR input
-            // queue AND the current foreground window's input queue to the target's
-            // thread for the duration of the call — Windows then treats us as the
-            // foreground thread and honours SetForegroundWindow. Detach in all cases.
-            let ok = unsafe {
-                let fg = GetForegroundWindow();
-                let target_thread = GetWindowThreadProcessId(hwnd, std::ptr::null_mut());
-                let fg_thread = GetWindowThreadProcessId(fg, std::ptr::null_mut());
-                let cur_thread = GetCurrentThreadId();
-
-                let attached_cur = target_thread != cur_thread
-                    && AttachThreadInput(cur_thread, target_thread, 1) != 0;
-                let attached_fg = fg_thread != 0
-                    && fg_thread != target_thread
-                    && fg_thread != cur_thread
-                    && AttachThreadInput(fg_thread, target_thread, 1) != 0;
-
-                AllowSetForegroundWindow(ASFW_ANY);
-                if IsIconic(hwnd) != 0 {
-                    ShowWindow(hwnd, SW_RESTORE);
-                } else {
-                    ShowWindow(hwnd, SW_SHOW);
+            let mut matched = false;
+            for needle in &candidates {
+                if try_focus(needle)? {
+                    matched = true;
+                    break;
                 }
-                BringWindowToTop(hwnd);
-                let set = SetForegroundWindow(hwnd) != 0;
-
-                if attached_fg {
-                    AttachThreadInput(fg_thread, target_thread, 0);
-                }
-                if attached_cur {
-                    AttachThreadInput(cur_thread, target_thread, 0);
-                }
-                set
-            };
-            if !ok {
-                // Non-fatal: the handle is valid and the attach dance usually still
-                // lands focus even when the return is 0. Record and continue.
-                eprintln!("control: SetForegroundWindow returned 0 (window still targeted)");
             }
+            if !matched {
+                return Err(format!(
+                    "control: no window matches title {:?} (nothing injected)",
+                    if self.title_match.trim().is_empty() {
+                        DEFAULT_TITLE_CANDIDATES.join(" / ")
+                    } else {
+                        self.title_match.clone()
+                    }
+                ));
+            }
+
             // Let the target actually receive focus before keys are injected —
-            // SendInput otherwise races the foreground switch and keys are dropped
-            // or land in the previous window.
+            // injection otherwise races the foreground switch and keys are
+            // dropped or land in the previous window (same 40ms settle as the
+            // former Windows impl).
             std::thread::sleep(std::time::Duration::from_millis(40));
-            self.hwnd = Some(hwnd);
             Ok(())
         }
 
@@ -663,18 +636,18 @@ mod windows_impl {
 
         pub fn command_bar(&mut self, cmd: &str) -> Result<(), String> {
             self.focus()?;
-            ctrl_k()?;
+            command_bar_hotkey()?;
             type_text_raw(cmd)?;
             tap(VK_RETURN)
         }
 
-        /// Focus the composer (Alt+Enter), then type — no Enter (K5 submits).
+        /// Focus the window, then type — no Enter (K5 submits).
         pub fn compose(&mut self, text: &str) -> Result<(), String> {
-            // Focus the window only, then type. This previously injected Alt+Enter
-            // to "focus the composer", but that chord SUBMITS in Kiro Crew — so it
-            // auto-sent whatever was already in the composer. Rely on the composer
-            // being the default focused control; typing never submits, and the user
-            // still submits explicitly with K5 (Enter).
+            // Focus the window only, then type. We deliberately do NOT inject a
+            // "focus the composer" chord: on Kiro Crew that chord SUBMITS, which
+            // would auto-send whatever was already in the composer. Rely on the
+            // composer being the default focused control; typing never submits,
+            // and the user still submits explicitly with K5 (Enter).
             self.focus()?;
             type_text_raw(text)
         }
@@ -687,11 +660,19 @@ mod windows_impl {
         pub fn start_delete_words(&mut self) -> Result<(), String> {
             self.stop_delete_words()?;
             self.focus()?;
-            let hwnd = self.hwnd.ok_or("control: target window unavailable")?;
 
             // Delete one word immediately when LONG arrives, then repeat after
-            // a short typematic delay while the same target remains foreground.
-            ctrl_tap(VK_BACK)?;
+            // a short typematic delay. BEHAVIOR DELTA vs Windows: the Windows
+            // impl re-checked GetForegroundWindow each iteration and stopped if
+            // focus moved away. There is no cheap crate-free macOS equivalent
+            // (a per-iteration osascript/CGWindow foreground check would add a
+            // crate or heavy FFI and shell out ~every 120ms), so we rely on the
+            // stop flag (set the instant joystick-left is released — the normal
+            // case) plus the tightened DELETE_REPEAT_MAX_DURATION backstop. The
+            // only residual gap is: focus moves elsewhere WHILE the key stays
+            // held, where deletes keep landing in whatever is focused until the
+            // 4s cap. Documented as an accepted delta (see the const above).
+            inject_chord(Chord::DeleteWord)?; // Option+Backspace
             let stop = Arc::new(AtomicBool::new(false));
             let worker_stop = Arc::clone(&stop);
             let worker = thread::Builder::new()
@@ -702,11 +683,7 @@ mod windows_impl {
                     while !worker_stop.load(Ordering::Acquire)
                         && started.elapsed() < DELETE_REPEAT_MAX_DURATION
                     {
-                        // Never continue injecting if focus moved to another app.
-                        if unsafe { GetForegroundWindow() } != hwnd {
-                            break;
-                        }
-                        if ctrl_tap(VK_BACK).is_err() {
+                        if inject_chord(Chord::DeleteWord).is_err() {
                             break;
                         }
                         thread::sleep(DELETE_REPEAT_INTERVAL);
@@ -729,32 +706,20 @@ mod windows_impl {
         }
     }
 
-    impl Drop for WinController {
+    impl Drop for MacController {
         fn drop(&mut self) {
             let _ = self.stop_delete_words();
         }
     }
-
-    // Silence dead-code warnings for the Win32 bindings kept for the window
-    // enumeration path / future close-menu use but not otherwise referenced;
-    // touched here so the linker keeps them honest.
-    #[allow(dead_code)]
-    fn _keep_win32_linked() -> (
-        unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> isize,
-        unsafe extern "system" fn(HWND, *mut u16, i32) -> i32,
-        unsafe extern "system" fn(HWND) -> i32,
-    ) {
-        (SendMessageW, GetWindowTextW, GetWindowTextLengthW)
-    }
 }
 
-// ============================ Non-Windows ============================
+// ============================ Non-macOS ============================
 
-#[cfg(not(windows))]
+#[cfg(not(target_os = "macos"))]
 mod stub_impl {
     use super::Chord;
 
-    /// Non-Windows stub: compiles and unit-tests on Linux. `focus` is a no-op
+    /// Non-macOS stub: compiles and unit-tests on Linux. `focus` is a no-op
     /// Ok (so router logic can be exercised end to end without a real window);
     /// the injecting methods return `Err` — there is no window system to drive.
     pub struct StubController {
@@ -776,23 +741,23 @@ mod stub_impl {
         }
 
         pub fn send_text(&mut self, _text: &str) -> Result<(), String> {
-            Err("control: windows only".to_string())
+            Err("control: macOS only".to_string())
         }
 
         pub fn command_bar(&mut self, _cmd: &str) -> Result<(), String> {
-            Err("control: windows only".to_string())
+            Err("control: macOS only".to_string())
         }
 
         pub fn compose(&mut self, _text: &str) -> Result<(), String> {
-            Err("control: windows only".to_string())
+            Err("control: macOS only".to_string())
         }
 
         pub fn chord(&mut self, _keys: Chord) -> Result<(), String> {
-            Err("control: windows only".to_string())
+            Err("control: macOS only".to_string())
         }
 
         pub fn start_delete_words(&mut self) -> Result<(), String> {
-            Err("control: windows only".to_string())
+            Err("control: macOS only".to_string())
         }
 
         pub fn stop_delete_words(&mut self) -> Result<(), String> {
@@ -803,14 +768,15 @@ mod stub_impl {
 
 // ─────────────── Public controller facade (platform-neutral) ───────────────
 
-#[cfg(windows)]
-type Backend = windows_impl::WinController;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+type Backend = macos_impl::MacController;
+#[cfg(not(target_os = "macos"))]
 type Backend = stub_impl::StubController;
 
 /// The FP-4b controller: focus a local Kiro Crew window and inject text / the
-/// command bar / chords. Windows-backed for real; a compiling no-op/Err stub
-/// elsewhere. Construct with [`KiroCrewController::new`].
+/// command bar / chords. macOS-backed for real (CoreGraphics key injection +
+/// AppleScript window focus); a compiling no-op/Err stub on every other host.
+/// Construct with [`KiroCrewController::new`].
 pub struct KiroCrewController {
     backend: Backend,
 }
@@ -828,7 +794,7 @@ impl KiroCrewController {
     }
 
     /// Resolve + foreground the window. Verifies a match before injecting
-    /// (AC1.5); on non-Windows this is a no-op `Ok`.
+    /// (AC1.5); on non-macOS this is a no-op `Ok`.
     pub fn focus(&mut self) -> Result<(), String> {
         self.backend.focus()
     }
@@ -838,12 +804,12 @@ impl KiroCrewController {
         self.backend.send_text(text)
     }
 
-    /// Focus, open the command bar (Ctrl+K), type `cmd`, press Enter.
+    /// Focus, open the command bar (Cmd+K on macOS), type `cmd`, press Enter.
     pub fn command_bar(&mut self, cmd: &str) -> Result<(), String> {
         self.backend.command_bar(cmd)
     }
 
-    /// Focus the composer (Alt+Enter), then type `text` (no Enter).
+    /// Focus the window, then type `text` (no Enter — K5 submits).
     pub fn compose(&mut self, text: &str) -> Result<(), String> {
         self.backend.compose(text)
     }
@@ -1218,9 +1184,9 @@ mod tests {
         assert_eq!(router.route(&key("k1", KeyAction::Down)), ControlAction::None);
     }
 
-    // ── Stub controller behaviour on non-Windows ───────────────
+    // ── Stub controller behaviour on non-macOS ─────────────────
 
-    #[cfg(not(windows))]
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn stub_controller_focus_ok_inject_err() {
         let mut c = KiroCrewController::new(None);
@@ -1228,7 +1194,7 @@ mod tests {
         assert!(c.send_text("x").is_err());
         assert!(c.command_bar("cmd").is_err());
         assert!(c.chord(Chord::Enter).is_err());
-        // apply() delegates: no-op/stop are safe; injection is Windows-only.
+        // apply() delegates: no-op/stop are safe; injection is macOS-only.
         assert!(c.apply(&ControlAction::None).is_ok());
         assert!(c.apply(&ControlAction::StopDeleteWords).is_ok());
         assert!(c.apply(&ControlAction::StartDeleteWords).is_err());

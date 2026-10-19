@@ -24,13 +24,13 @@
 - **固件（TuyaOpen C）**：输入扫描 + 去抖 → 事件与状态机 →
   LVGL @ ST7789 UI + 可替换传输层（UART / BLE GATT / BLE HID）。
 - **上位机（Tauri: Rust + React/TS）**：传输后端 + 协议解析 → 事件路由/映射 →
-  Win32 SendInput 注入 / 剪贴板粘贴 / Windows 系统 ASR → 注入到焦点 Kiro 窗口；
+  macOS CoreGraphics 按键注入 / 剪贴板粘贴 / macOS Dictation + Apple Speech → 注入到焦点 Kiro 窗口；
   Kiro CLI hook（JSONL）→ 把 Agent 状态回写到板子。
 
 ## 路线图（分阶段，每阶段独立可演示）
 
 1. **阶段 0** — 脚手架与硬件定义（仓库骨架、引脚映射）。
-2. **阶段 1** — 有线 MVP：串口 + Tauri 上位机 + Windows 系统 ASR。
+2. **阶段 1** — 有线 MVP：串口 + Tauri 上位机 + macOS Dictation / Apple Speech。
 3. **阶段 2** — 无线化：BLE GATT + 板端唤醒词 + 在线 ASR。
 4. **阶段 3** — BLE HID 直连 + 可选板端本地 ASR。
 

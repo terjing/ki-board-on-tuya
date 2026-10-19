@@ -3,17 +3,20 @@
 //! Layering:
 //! * [`protocol`] — pure v1 wire codec (no IO, unit-tested on any host).
 //! * [`transport`] — `serialport`-based UART backend + a stable transport trait.
-//! * [`inject`] / [`asr`] — Windows-only key injection and system dictation,
-//!   each a trait with a real `#[cfg(windows)]` impl and a non-Windows stub.
+//! * [`inject`] / [`asr`] — macOS-native key injection and system dictation,
+//!   each a trait with a real `#[cfg(target_os = "macos")]` impl and a
+//!   non-macOS stub.
 //! * [`status_sink`] — FP-4b STATUS ("the eyes"): a pure `map_hook_event` (T5)
 //!   plus a cross-platform `tiny_http` localhost sink (T6) that ingests Kiro
 //!   agent-hook events (delivered by this same binary's `--hook` mode) and a
-//!   `{port, token}` handoff file the `--hook` mode reads. Only the callback
-//!   that emits a `display` frame is `#[cfg(windows)]` (in the app module).
+//!   `{port, token}` handoff file the `--hook` mode reads. The callback that
+//!   emits a `display` frame lives in the macOS-gated app module.
 //! * [`describe_inbound`] / [`inbound_to_json`] — pure frame-routing helpers,
 //!   shared by the Tauri reader thread and testable on Linux.
-//! * The Tauri application itself (`app` module + [`run`]) is `#[cfg(windows)]`
-//!   because Tauri needs WebKitGTK, which is absent on the Linux CI host.
+//! * The Tauri application itself (`app` module + [`run`]) is
+//!   `#[cfg(target_os = "macos")]` because the macOS bundle links the system
+//!   WebKit/Cocoa frameworks that are absent on the Linux CI host; the
+//!   non-macOS build keeps the pure Rust core compilable and unit-testable.
 
 pub mod app_dirs;
 pub mod asr;
@@ -115,7 +118,7 @@ fn seq_suffix(seq: Option<u64>) -> String {
     }
 }
 
-#[cfg(any(test, target_os = "windows"))]
+#[cfg(any(test, target_os = "macos"))]
 fn ensure_usb_provisioning_transport(
     connected: bool,
     kind: transport::TransportKind,
@@ -187,21 +190,22 @@ pub fn inbound_to_json(frame: &Inbound) -> serde_json::Value {
     }
 }
 
-/// Launch the desktop application (Windows).
-#[cfg(target_os = "windows")]
+/// Launch the desktop application (macOS).
+#[cfg(target_os = "macos")]
 pub fn run() {
     app::run();
 }
 
-/// Keep the pure Rust core testable on the Linux build host without GTK/WebKit.
-#[cfg(not(target_os = "windows"))]
+/// Keep the pure Rust core testable on the Linux build host without the macOS
+/// WebKit/Cocoa frameworks.
+#[cfg(not(target_os = "macos"))]
 pub fn run() {
-    eprintln!("the Companion desktop application is supported on Windows");
+    eprintln!("the Companion desktop application is supported on macOS");
 }
 
-// ───────────────────────── Tauri application (Windows) ─────────────────────────
+// ───────────────────────── Tauri application (macOS) ─────────────────────────
 
-#[cfg(target_os = "windows")]
+#[cfg(target_os = "macos")]
 mod app {
     use crate::diagnostics;
     use crate::crew_api::{
@@ -244,15 +248,17 @@ mod app {
         device_volume: u8,
         device_brightness: u8,
         device_settings_synced: bool,
-        /// FP-4b (route B): the window-focus + SendInput controller ("the
-        /// hands") and the pure router that maps board events to control
-        /// actions. This is the control path that supersedes route A.
+        /// FP-4b (route B): the window-focus + CoreGraphics key-injection
+        /// controller ("the hands") and the pure router that maps board events
+        /// to control actions. Window focus uses AppleScript (osascript /
+        /// System Events); key injection uses CoreGraphics. This is the control
+        /// path that supersedes route A.
         kc_controller: KiroCrewController,
         kc_router: ControlRouter,
         /// Enabled by default so board events immediately drive the local Kiro
         /// Crew window. When false, board key/nav frames only reflect trigger
         /// state in the INPUT view; every board-triggered PC action, including
-        /// K4 / Win+H, is blocked until control is enabled again.
+        /// K4 / macOS Dictation, is blocked until control is enabled again.
         control_enabled: bool,
         /// FP-4b STATUS ("the eyes"): the running localhost hook sink, if
         /// started. `status_sink_start` sets it; `status_sink_stop` / drop
@@ -1550,8 +1556,9 @@ mod app {
     }
 
     /// API-first board control. Returns true when the frame was consumed by the
-    /// stable-slot REST path. False means the caller should use the legacy
-    /// focus/SendInput route as fallback.
+    /// stable-slot REST path. False means the caller should use the
+    /// focus-and-inject route as fallback (AppleScript window focus +
+    /// CoreGraphics key injection).
     fn route_board_via_crew_api(app: &AppHandle, state: &Shared, frame: &Inbound) -> bool {
         let api_ready = state
             .inner
@@ -1790,10 +1797,15 @@ mod app {
         }
 
         // FP-5: on a voice-start edge, if the active source is the PC's own ASR,
-        // activate OS dictation (Win+H). Board-mic (cloud) source is a no-op here.
+        // try to activate macOS Dictation. NOTE: `activator().activate()` is a
+        // not-yet-wired seam on macOS (Dictation's trigger is a fixed modifier
+        // double-press, not a bindable chord — see pc_asr.rs), so this currently
+        // only focuses the Kiro Crew window and logs that activation is unwired;
+        // real one-key activation is a documented follow-up. Board-mic (cloud)
+        // source is a no-op here.
         // GATED on `control_enabled` (same gate as route B): while control is
         // disabled the K4 voice frame only reflects trigger state in the UI and
-        // NEVER activates Win+H — no board frame drives the PC/Kiro Crew.
+        // NEVER activates Dictation — no board frame drives the PC/Kiro Crew.
         if let Inbound::Voice { payload, .. } = &frame {
             let (enabled, source) = state
                 .inner
@@ -1807,21 +1819,23 @@ mod app {
                 // text left from the previous dictation (confirmed off-by-one on
                 // hardware — each K4 press submitted the prior utterance). Window
                 // focus alone is enough (the composer is the default focused
-                // control) and can never submit. Best-effort; Win+H still fires if
-                // focus fails (the user may already be on the window).
+                // control) and can never submit. Best-effort focus; the
+                // Dictation activation step below is currently a seam that
+                // returns Err until real activation is wired.
                 if let Ok(mut inner) = state.inner.lock() {
                     let _ = inner.kc_controller.focus();
                 }
                 match pc_asr::activator().activate() {
-                    Ok(()) => log_line(app, "[PC-ASR] focused window + activated OS dictation (Win+H)"),
-                    Err(e) => log_line(app, format!("[PC-ASR] activate failed: {e}")),
+                    Ok(()) => log_line(app, "[PC-ASR] focused window + activated macOS Dictation"),
+                    Err(e) => log_line(app, format!("[PC-ASR] focused window; Dictation activation not wired: {e}")),
                 }
             }
         }
 
         // Primary route: stable Crew slot REST control. When API is connected
         // and Chat A/B/C has an API slot binding, consume the frame without
-        // focusing a window. Otherwise preserve the legacy SendInput behavior.
+        // focusing a window. Otherwise fall back to the focus-and-inject route
+        // (AppleScript window focus + CoreGraphics key injection).
         let api_consumed = route_board_via_crew_api(app, state, &frame);
         if !api_consumed {
             let (enabled, action) = state

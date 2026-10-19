@@ -27,14 +27,14 @@ improve the Kiro CLI / IDE development experience. Its differentiators are
 - **Firmware (TuyaOpen C)**: input scan + debounce → event & state machine →
   LVGL @ ST7789 UI + pluggable transport (UART / BLE GATT / BLE HID).
 - **Companion (Tauri: Rust + React/TS)**: transport backend + protocol parser →
-  event routing/mapping → Win32 SendInput injection / clipboard paste / Windows
-  system ASR → inject into the focused Kiro window; Kiro CLI hook (JSONL) →
-  reflect Agent status back to the board.
+  event routing/mapping → macOS CoreGraphics key injection / clipboard paste /
+  macOS Dictation + Apple Speech → inject into the focused Kiro window; Kiro CLI
+  hook (JSONL) → reflect Agent status back to the board.
 
 ## Roadmap (phased, each independently demoable)
 
 1. **Phase 0** — Scaffolding & hardware definition (repo skeleton, pin map).
-2. **Phase 1** — Wired MVP: serial + Tauri companion + Windows system ASR.
+2. **Phase 1** — Wired MVP: serial + Tauri companion + macOS Dictation / Apple Speech.
 3. **Phase 2** — Wireless: BLE GATT + on-board wake word + online ASR.
 4. **Phase 3** — BLE HID direct connect + optional on-board local ASR.
 

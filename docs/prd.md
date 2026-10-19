@@ -101,8 +101,8 @@
 │   ↓                  │  JSONL │   ↓                        │
 │ 事件与状态机          │◄──────►│ 协议解析/路由               │
 │   ↓                  │ UART/  │   ↓                        │
-│ LVGL @ ST7789 UI     │ BLE    │ SendInput 注入 / 剪贴板粘贴 │
-│ 可替换传输层          │        │ Windows ASR / 云 ASR 协同   │
+│ LVGL @ ST7789 UI     │ BLE    │ CoreGraphics 注入 / 剪贴板  │
+│ 可替换传输层          │        │ macOS ASR / 云 ASR 协同     │
 └──────────────────────┘        └────────────┬──────────────┘
                                              │
                                    ┌─────────┴──────────┐
@@ -124,11 +124,11 @@
 板载 MIC → Wi-Fi 云 ASR ┘        (AI_USER_EVT_ASR_OK)
 ```
 
-**上行（设备→PC）**：按键/摇杆/语音事件 → JSONL over UART/BLE → Companion → 映射 → SendInput/粘贴 → Kiro 窗口
+**上行（设备→PC）**：按键/摇杆/语音事件 → JSONL over UART/BLE → Companion → 映射 → macOS CoreGraphics/粘贴 → Kiro 窗口
 
 **下行（PC→设备）**：Kiro CLI hook → Companion → JSONL → 设备 → LCD 显示 Agent 状态
 
-**语音方式②（一期）**：设备语音键 → `voice:start` → Companion 调 Windows ASR（**PC 麦克风**）→ 文本注入
+**语音方式②（一期）**：设备语音键 → `voice:start` → Companion 调 macOS Dictation / Apple Speech（**PC 麦克风**）→ 文本注入
 （此路径设备不采音，仅作触发器）
 
 **语音方式①**：设备语音键 → 板载 MIC 采音 → Wi-Fi 云 ASR → `AI_USER_EVT_ASR_OK` 取文本 → 经协议给 Companion → 注入
@@ -335,7 +335,7 @@
 
 | 方式 | 优先级 | 阶段 | 实现 | 关键 API / 前置条件 |
 |------|-------|------|------|-------------------|
-| ② PC 端收声 + 本机/3P ASR | **P0** | 一期 | 设备发 `voice:start` → Companion 用 **PC 麦克风** + Windows.Media.SpeechRecognition 听写 → 注入 | 纯 PC 侧，无前置条件。⚠️ **此方式下设备在语音链路中无角色**（不采音），仅作触发器 |
+| ② PC 端收声 + 本机/3P ASR | **P0** | 一期 | 设备发 `voice:start` → Companion 用 **PC 麦克风** + macOS Dictation / Apple Speech (SFSpeechRecognizer) 听写 → 注入 | 纯 PC 侧，无前置条件。⚠️ **此方式下设备在语音链路中无角色**（不采音），仅作触发器 |
 | ① 板载 MIC + 云 ASR | **P1** | 一期 | 板载 MIC 采音（16kHz/16bit，含 AEC）→ Wi-Fi 上云 → 取文字 → 经协议给 Companion → 注入 | `ai_chat_init` + `ai_user_event_notify_register(cb)` → 事件 `AI_USER_EVT_ASR_OK` → 从 `AI_NOTIFY_TEXT_T.data` 取文本。**需 Wi-Fi 配网 + 涂鸦云 AI 授权（UUID/AuthKey）** |
 | ③ 板载 MIC → 传 PC → PC ASR | P2 | 二期 | 板端取 PCM 经 UART/BLE 传 PC，PC 侧 ASR | `ai_audio_input` 的 `AI_AUDIO_OUTPUT output_cb` 或 `AI_USER_EVT_MIC_DATA` 取 PCM。**带宽**：16k×16bit ≈ **256kbps** → USB 串口（高波特）可行；**BLE 需压缩**（ADPCM/Opus） |
 
@@ -422,7 +422,7 @@
 ### FR-8 无弹窗与打包 · P1
 
 - 纳入 `powershell_shim`（Rust GUI 子系统）消除 Kiro hook 触发的控制台黑框。
-- Companion 经 `tauri build` 产出 Windows 安装包（NSIS）。
+- Companion 经 `tauri build` 产出 macOS 安装包（DMG / .app bundle）。
 
 ---
 
@@ -549,8 +549,8 @@ Windows 走**云编译 + 本地烧录**（见 `tuya-kb/03-toolchain-setup/01-clo
 | `transport/usb_serial.rs` | serialport 连接、VID/PID 自动发现、行读取线程 | 🔲 骨架（Task 6 实现） |
 | `transport/ble_gatt.rs` | btleplug 扫描/连接/通知 | 🔲 骨架（Task 13 实现） |
 | `protocol.rs` | JSONL 编解码、坏帧容错 | ✅ 骨架 + 3 单测通过 |
-| 注入层 | Win32 SendInput / arboard 粘贴 | 🔲 Task 7 |
-| ASR 层 | Windows.Media.SpeechRecognition (WinRT via `windows` crate) | 🔲 Task 8 |
+| 注入层 | macOS CoreGraphics 按键注入 / arboard 粘贴 | 🔲 Task 7 |
+| ASR 层 | Apple Speech (SFSpeechRecognizer) / macOS Dictation | 🔲 Task 8 |
 | hook 服务 | 接收 Kiro hook JSONL，转 `display` 下发 | 🔲 Task 10 |
 | 前端 | React/TS，事件显示、映射配置、传输选择 | ✅ 骨架窗口 |
 
@@ -584,7 +584,7 @@ Windows 走**云编译 + 本地烧录**（见 `tuya-kb/03-toolchain-setup/01-clo
 | 电池续航 | 目标 ≥ 4h 连续使用（依电池容量，实测确定） |
 | 可靠性 | 断连自动重连；Companion 崩溃后 hook 可回退直连串口 |
 | 安全 | BLE 需配对 token；UART 物理可信；密钥不入库、不出现在日志 |
-| 兼容性 | PC 端 Windows 优先（一期）；BLE HID 阶段兼容主流系统 |
+| 兼容性 | PC 端 macOS 原生（一期）；BLE HID 阶段兼容主流系统 |
 
 ---
 
@@ -593,7 +593,7 @@ Windows 走**云编译 + 本地烧录**（见 `tuya-kb/03-toolchain-setup/01-clo
 | 阶段 | 范围 | Demo 验收标准 |
 |------|------|--------------|
 | **阶段 0** 脚手架与硬件定义 | 仓库骨架、引脚映射、BOM、协议草案 | ✅ 已完成：结构可浏览、协议可读、`check_pins.py` 通过、BOM 标记采购 |
-| **阶段 1** 有线 MVP | 固件心跳→输入扫描→UART 协议→Companion 串口→注入→Windows ASR→LCD→hook 状态→打包 | 完整有线闭环：按键触发命令、说话出文本、LCD 显示 Agent 状态、无弹窗、安装包可分发 |
+| **阶段 1** 有线 MVP | 固件心跳→输入扫描→UART 协议→Companion 串口→注入→macOS ASR→LCD→hook 状态→打包 | 完整有线闭环：按键触发命令、说话出文本、LCD 显示 Agent 状态、无弹窗、安装包可分发 |
 | **阶段 2** 无线化 | BLE GATT 固件+Companion、板端唤醒词+在线 ASR | 拔掉 USB，BLE 下功能等价；对板说话文本进 Kiro |
 | **阶段 3** 直连与本地化 | BLE HID、（可选）板端本地 ASR | 不装 PC 软件即可作蓝牙键盘；断网可识别固定指令 |
 
@@ -647,7 +647,7 @@ Windows 走**云编译 + 本地烧录**（见 `tuya-kb/03-toolchain-setup/01-clo
 | ASR / KWS | 自动语音识别 / 唤醒词检测 |
 | RTP | 电阻式触摸屏 |
 | DP | 涂鸦 Data Point（数据点） |
-| 注入 | 用 Win32 SendInput/剪贴板把输入送进焦点窗口 |
+| 注入 | 用 macOS CoreGraphics/剪贴板把输入送进焦点窗口 |
 
 ### 11.2 参考资料
 

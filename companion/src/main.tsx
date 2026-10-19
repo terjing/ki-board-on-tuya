@@ -477,7 +477,7 @@ function App() {
 
   // Enable/disable routing board keys to Kiro Crew control. Default ON so the
   // Companion is ready to drive Kiro Crew immediately; disabling it still
-  // gates every board-triggered PC action, including K4 / Win+H.
+  // gates every board-triggered PC action, including K4 / macOS Dictation.
   async function toggleControl(enabled: boolean) {
     await invoke("set_control_enabled", { enabled });
     setStatus((s) => ({ ...s, control_enabled: enabled }));
@@ -1257,9 +1257,9 @@ function App() {
             <p className="hint">
               <strong>Board cloud ASR</strong>: the board mic feeds Tuya cloud ASR; recognized text
               returns as an <code>asr</code> frame. <strong>PC system ASR</strong>: a K4 press sends
-              <code> voice.start</code> and the companion activates Windows dictation (Win+H). The
-              choice is mirrored to the board (and the board can switch it too — this reflects the
-              board's reported path).
+              <code> voice.start</code> and the companion activates macOS Dictation via your
+              configured Dictation keyboard shortcut. The choice is mirrored to the board (and the
+              board can switch it too — this reflects the board's reported path).
             </p>
 
             <label style={{ marginTop: 14 }}>WiFi provisioning (for board cloud ASR)</label>

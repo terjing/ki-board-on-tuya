@@ -3,8 +3,8 @@
 //!
 //! Two layers live here, both **cross-platform** so `cargo check` / `cargo test`
 //! build them on the Linux CI host (only the callback wiring that actually emits
-//! a `display` frame — which needs the Tauri transport — is `#[cfg(windows)]` in
-//! `lib.rs`):
+//! a `display` frame — which needs the Tauri transport — is gated on
+//! `target_os = "macos"` in `lib.rs`):
 //!
 //! * **Pure mapping (T5).** [`HookEvent`] is the slimmed hook payload the
 //!   companion's `--hook` mode POSTs, and [`map_hook_event`] maps it to a

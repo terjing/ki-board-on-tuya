@@ -15,8 +15,8 @@
 - 硬件：T5AI-Core（T5-E1 模组）+ CL28CK230-18A LCD（ST7789，320×240，SPI）+ WS-1002 5向开关 + 5× 茶轴（CPG151101D06）+ 板载 Mic/Speaker
 - 固件框架：原生 TuyaOpen SDK + `tos.py`，**原生 Windows 编译**（Git Bash，无需 WSL；本机实测当前仓库路径可正常构建，无需规避 C 盘 / 中文 / 空格）
 - 连接分阶段：阶段1 有线（UART/USB-CDC + Companion）→ 阶段2 BLE GATT + Companion → 阶段3 BLE HID 直连
-- 语音分阶段：阶段1 Windows 系统 ASR（PC 端，笔记本麦克风）→ 阶段2 板端唤醒词 + 在线 ASR → 阶段3（可选）板端本地 ASR
-- Companion：Windows 优先，**Tauri (Rust + React/TypeScript)**，对照 `ref_projects/ki-board/` 的 `transport`/`protocol`/ASR 结构复用
+- 语音分阶段：阶段1 macOS Dictation / Apple Speech（PC 端，笔记本麦克风）→ 阶段2 板端唤醒词 + 在线 ASR → 阶段3（可选）板端本地 ASR
+- Companion：macOS 原生，**Tauri (Rust + React/TypeScript)**，对照 `ref_projects/ki-board/` 的 `transport`/`protocol`/ASR 结构复用
 - 从 `ref_projects/ki-board/` 借鉴纳入：Kiro CLI hook → Agent 状态上屏、`powershell_shim` 消弹窗、串口 VID/PID 自动发现、可替换传输层、`ble_probe`/`asr_probe`/`ota_flash` 探针工具
 
 ## 技术结论（已核实）
@@ -29,7 +29,7 @@
 
 ## 架构总览
 固件（TuyaOpen C）：输入扫描+去抖 → 事件与状态机 → LVGL@ST7789 UI + 可替换传输层（UART / BLE GATT / BLE HID）。
-Companion（Tauri: Rust + React/TS）：传输后端+协议解析 → 事件路由/映射 → SendInput 注入 / arboard 粘贴 / Windows 系统 ASR → 注入 Kiro 焦点窗口；Kiro CLI hook JSONL → 回写板子状态。
+Companion（Tauri: Rust + React/TS）：传输后端+协议解析 → 事件路由/映射 → macOS CoreGraphics 按键注入 / arboard 粘贴 / macOS Dictation + Apple Speech → 注入 Kiro 焦点窗口；Kiro CLI hook JSONL → 回写板子状态。
 
 ## 传输协议（阶段1 定稿、跨阶段复用）
 - 阶段1 载体 UART 115200/8N1；阶段2 BLE 特征值；协议内容不变
@@ -44,16 +44,16 @@ Companion（Tauri: Rust + React/TS）：传输后端+协议解析 → 事件路�
 - **Task 1: 仓库骨架与文档基线**。建 `firmware/`、`companion/`、`hardware/`、`docs/`、`shared/protocol/`；README 中英双版；协议草案 `docs/protocol.md`（中文）。companion 用 create-tauri-app（React+TS）初始化；firmware 预留 TuyaOpen app 结构；代码注释英文。测试：Tauri 空窗可起、Rust `cargo test` 占位单测通过。Demo：结构可浏览 + 空壳窗口启动 + 协议草案可读。
 - **Task 2: 引脚映射与硬件连接清单**。基于 T5 Pinmux + T5AI-Core SCH，产出 5 按键/5向开关/ST7789 SPI/背光/(预留)音频的确定 GPIO 分配，避开 P9/P29；输出 `hardware/pinmap.md` + jlceda-mcp 可用网表。LCD 用硬件 SPI；按键直连 GPIO 带内部上拉。测试：脚本校验引脚无冲突。Demo：pinmap + 网表 + 校验脚本通过。
 
-### 阶段 1：有线 MVP（串口 + Tauri Companion + Windows 系统 ASR）
+### 阶段 1：有线 MVP（串口 + Tauri Companion + macOS Dictation / Apple Speech）
 - **Task 3: 固件可编译烧录（心跳 + 板级 Config）**。`tos.py` 基于 `TUYA_T5AI_CORE.config` 建最小 app，串口打印心跳。记录原生 Windows 环境搭建步骤到 docs。测试：串口见周期心跳。Demo：上电串口输出心跳。
 - **Task 4: 输入扫描——按键与 5 向开关**。带去抖(~10-20ms)与长按阈值，产生 key/nav 按下/抬起/长按事件；状态机抽成可单测模块。测试：host 侧状态机单测。Demo：按键/拨摇杆串口实时打印事件。
 - **Task 5: 固件传输层——UART 事件上报（协议 v1）**。事件按 JSON 行经 UART 发出，seq 递增 + ack；传输层做成接口，UART 为首个后端。测试：host 协议编解码单测 + 串口抓包。Demo：操作输入→串口见规范帧。
 - **Task 6: Companion 串口后端与协议解析（Rust）**。Tauri Rust 侧用 serialport 连 COM、解析协议、事件经 Tauri event 推前端；VID/PID+product 自动发现端口。解析器与 IO 解耦、坏帧容错；对照 ki-board `usb_serial.rs`+`protocol.rs`。测试：cargo test 字节流回放 + 坏帧用例。Demo：板操作→Tauri 窗口实时显示事件。
-- **Task 7: Companion 键盘注入到焦点窗口**。key/nav/macro 按可配置映射转真实按键，Win32 SendInput 注入；长文本用 arboard 粘贴。映射表 JSON，支持组合键与宏；注入层封装可测。测试：注入层 mock 断言 INPUT 序列 + 记事本/终端手动验收。Demo：Kiro 终端聚焦下按板键触发预设命令。
-- **Task 8: 语音触发→Windows 系统 ASR→文本注入（阶段1 核心）**。板上语音键发 voice:start；Companion 调 Windows.Media.SpeechRecognition（WinRT，经 windows crate，用笔记本麦克风）听写，文本经注入层进入焦点窗口。先做一句话听写，处理无结果/超时/权限；先写独立探针 example 验证 WinRT 链路。测试：ASR 封装 mock 单测 + 真实语音验收。Demo：聚焦 Kiro 说话，识别文本自动出现。
+- **Task 7: Companion 键盘注入到焦点窗口**。key/nav/macro 按可配置映射转真实按键，macOS CoreGraphics 注入；长文本用 arboard 粘贴。映射表 JSON，支持组合键与宏；注入层封装可测。测试：注入层 mock 断言 INPUT 序列 + 记事本/终端手动验收。Demo：Kiro 终端聚焦下按板键触发预设命令。
+- **Task 8: 语音触发→macOS 系统 ASR→文本注入（阶段1 核心）**。板上语音键发 voice:start；Companion 调 Apple Speech（SFSpeechRecognizer，经 ApplicationServices/Speech framework，用笔记本麦克风）听写，文本经注入层进入焦点窗口。先做一句话听写，处理无结果/超时/权限；先写独立探针 example 验证 Apple Speech 链路。测试：ASR 封装 mock 单测 + 真实语音验收。Demo：聚焦 Kiro 说话，识别文本自动出现。
 - **Task 9: LCD UI（LVGL @ ST7789）与状态显示**。接 ST7789+LVGL，显示按键提示/语音录制态/连接态，预留 Agent 状态区；显示逻辑与数据解耦。测试：host 侧 UI 状态映射单测。Demo：操作与语音时屏上实时反映状态。
 - **Task 10: Kiro CLI hook → Agent 状态上屏**。移植/改写 kiro_board_hook（Python 或 Rust），把 agentSpawn/userPromptSubmit/stop/postToolUse 转 JSONL，经 Companion 下发到板，LCD 显示 Agent 名与 Idle/Running/Error；hook 优先交 Companion，不可用回退直连 CDC；PC→板走协议 display。测试：mock hook 事件断言 display 命令 + 端到端验收。Demo：Kiro 跑 agent，LCD 实时显示状态。
-- **Task 11: Windows 弹窗消除（powershell shim）+ 阶段1 打包**。纳入 powershell_shim（Rust GUI 子系统）消 Kiro hook 黑框，提供 kiro-silent.bat；tauri build 出 Windows 安装包。测试：hook 运行无弹窗 + 安装包可运行。Demo：完整有线闭环（按键/语音/Agent 状态全通、无弹窗、安装包可分发）。
+- **Task 11: hook 噪声消除 + 阶段1 打包**。消除 Kiro hook 触发的终端噪声（macOS 下静默运行 hook 子进程）；tauri build 出 macOS 安装包（DMG / .app bundle）。测试：hook 运行无弹窗 + 安装包可运行。Demo：完整有线闭环（按键/语音/Agent 状态全通、无弹窗、安装包可分发）。
 
 ### 阶段 2：无线化（BLE GATT + Companion；板端唤醒 + 在线 ASR）
 - **Task 12: 固件 BLE GATT 自定义服务**。新增 ble_gatt 传输后端，复用协议 v1，经 GATT 特征值收发；与 UART 后端并存可切换；处理配对/重连。测试：host 协议层复用测试 + BLE 抓包。Demo：拔 USB，BLE 下按键/状态同步照常。

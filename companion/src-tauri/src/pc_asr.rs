@@ -2,12 +2,30 @@
 //!
 //! MVP requirement (4): besides the board mic → Tuya cloud ASR (FP-3), the user
 //! can one-key activate the PC's own ASR. When the active voice source is
-//! `System`, a board `voice.start` (K4 PTT) toggles Windows Voice Typing via the
-//! **Win+H** chord, so the OS types recognized speech into the focused window
-//! (e.g. the Kiro composer). No API keys, no companion-side recognizer needed.
+//! `System`, a board `voice.start` (K4 PTT) triggers macOS Dictation so the OS
+//! types recognized speech into the focused window (e.g. the Kiro composer). No
+//! API keys, no companion-side recognizer needed.
+//!
+//! macOS caveat (why this is a not-yet-wired seam, like `asr.rs`): macOS
+//! Dictation's trigger is NOT a bindable modifier+key chord. System Settings >
+//! Keyboard > Dictation exposes only a FIXED dropdown of shortcuts — "Press
+//! Left/Right/Either Command Key Twice", "Press Control Key Twice", "Press
+//! Fn/Globe", or "Off" — none of which is an arbitrary chord a program can
+//! assign, and all of which are modifier *double-presses* that a single
+//! `CGEventCreateKeyboardEvent` cannot reproduce. There is therefore no
+//! crate-free CoreGraphics chord that reliably starts Dictation on a stock
+//! machine (and Control+Space, the obvious candidate, is the system default for
+//! "Select the previous input source", so posting it toggles the input menu
+//! instead). Rather than claim a configuration step the OS does not expose, the
+//! macOS activator is an explicit seam: `activate()` returns a descriptive
+//! `Err` and `is_available()` returns `false`. Wiring real one-key activation
+//! is a documented follow-up (e.g. a user-created macOS *Keyboard Shortcut* or
+//! a Shortcuts.app automation that runs Dictation, which the companion could
+//! then invoke, or an NSApplication-level approach), tracked alongside the
+//! Apple Speech seam in `asr.rs`.
 //!
 //! Platform strategy mirrors `inject.rs` / `asr.rs`: a trait with a real
-//! `#[cfg(windows)]` `SendInput` impl and a non-Windows stub, so the Linux build
+//! `#[cfg(target_os = "macos")]` impl and a non-macOS stub, so the Linux build
 //! stays crate-clean and the pure router below is unit-tested on any host.
 
 use crate::protocol::VoiceState;
@@ -63,7 +81,9 @@ pub fn route_voice(source: VoiceSource, state: VoiceState) -> VoiceAction {
 
 /// Activates the OS's built-in dictation (types into the focused window).
 pub trait PcAsrActivator: Send {
-    /// Toggle the OS dictation bar (route A: Win+H on Windows).
+    /// Trigger the OS dictation. On macOS this is currently a not-yet-wired
+    /// seam that returns `Err` (see the module doc: Dictation's trigger is a
+    /// fixed modifier double-press, not a bindable chord).
     fn activate(&self) -> Result<(), String>;
     /// True when this backend can actually activate on the current host.
     fn is_available(&self) -> bool;
@@ -71,100 +91,55 @@ pub trait PcAsrActivator: Send {
 
 /// Construct the platform activator.
 pub fn activator() -> Box<dyn PcAsrActivator> {
-    #[cfg(windows)]
+    #[cfg(target_os = "macos")]
     {
-        Box::new(windows_impl::WinHActivator)
+        Box::new(macos_impl::DictationActivator)
     }
-    #[cfg(not(windows))]
+    #[cfg(not(target_os = "macos"))]
     {
         Box::new(stub::StubActivator)
     }
 }
 
-// ───────────────────────────── Windows ─────────────────────────────
+// ────────────────────────────── macOS ──────────────────────────────
 
-#[cfg(windows)]
-mod windows_impl {
+/// macOS Dictation activation — a not-yet-wired seam (mirrors `asr.rs`).
+///
+/// There is no crate-free, reliable way to start macOS Dictation from a
+/// synthetic key event: the OS exposes Dictation's trigger only as a fixed
+/// dropdown of modifier *double-presses* (see the module doc), none of which a
+/// single `CGEventCreateKeyboardEvent` chord can reproduce, and the obvious
+/// Control+Space candidate is the default input-source switch. Posting a chord
+/// here would silently do the wrong thing while *claiming* success, so instead
+/// `activate()` returns a descriptive `Err` and `is_available()` is `false`
+/// — exactly like the Apple Speech seam in `asr.rs`. A follow-up can wire real
+/// activation (a user-created macOS Keyboard Shortcut / Shortcuts.app
+/// automation that runs Dictation, invoked here via `osascript`/`shortcuts
+/// run`, or an NSApplication-level approach); that work needs a mac host to
+/// verify and is out of scope for the Linux-only offline conversion.
+#[cfg(target_os = "macos")]
+mod macos_impl {
     use super::PcAsrActivator;
-    use std::mem::size_of;
 
-    const INPUT_KEYBOARD: u32 = 1;
-    const KEYEVENTF_KEYUP: u32 = 0x0002;
-    const VK_LWIN: u16 = 0x5B;
-    const VK_H: u16 = 0x48;
+    pub struct DictationActivator;
 
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct KEYBDINPUT {
-        w_vk: u16,
-        w_scan: u16,
-        dw_flags: u32,
-        time: u32,
-        dw_extra_info: usize,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct INPUT {
-        r#type: u32,
-        ki: KEYBDINPUT,
-        _pad: [u8; 8],
-    }
-
-    #[link(name = "user32")]
-    extern "system" {
-        fn SendInput(c_inputs: u32, p_inputs: *const INPUT, cb_size: i32) -> u32;
-    }
-
-    fn vkey_event(vk: u16, key_up: bool) -> INPUT {
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            ki: KEYBDINPUT {
-                w_vk: vk,
-                w_scan: 0,
-                dw_flags: if key_up { KEYEVENTF_KEYUP } else { 0 },
-                time: 0,
-                dw_extra_info: 0,
-            },
-            _pad: [0; 8],
-        }
-    }
-
-    pub struct WinHActivator;
-
-    impl PcAsrActivator for WinHActivator {
+    impl PcAsrActivator for DictationActivator {
         fn activate(&self) -> Result<(), String> {
-            // Win+H toggles Windows Voice Typing. Press order: LWIN down, H down,
-            // H up, LWIN up.
-            let events = [
-                vkey_event(VK_LWIN, false),
-                vkey_event(VK_H, false),
-                vkey_event(VK_H, true),
-                vkey_event(VK_LWIN, true),
-            ];
-            let sent = unsafe {
-                SendInput(
-                    events.len() as u32,
-                    events.as_ptr(),
-                    size_of::<INPUT>() as i32,
-                )
-            };
-            if sent as usize == events.len() {
-                Ok(())
-            } else {
-                Err(format!("SendInput injected {sent}/{} events", events.len()))
-            }
+            Err("macOS Dictation one-key activation not yet wired: its trigger \
+                 is a fixed modifier double-press, not a bindable chord \
+                 (phase-1 seam, see pc_asr.rs module doc)"
+                .into())
         }
 
         fn is_available(&self) -> bool {
-            true
+            false
         }
     }
 }
 
-// ─────────────────────────── Non-Windows ───────────────────────────
+// ─────────────────────────── Non-macOS ───────────────────────────
 
-#[cfg(not(windows))]
+#[cfg(not(target_os = "macos"))]
 mod stub {
     use super::PcAsrActivator;
 
@@ -172,7 +147,7 @@ mod stub {
 
     impl PcAsrActivator for StubActivator {
         fn activate(&self) -> Result<(), String> {
-            eprintln!("pc_asr: OS dictation activation unsupported on this host (Windows-only)");
+            eprintln!("pc_asr: OS dictation activation unsupported on this host (macOS-only)");
             Ok(())
         }
 
@@ -229,7 +204,7 @@ mod tests {
         assert_eq!(VoiceSource::Cloud.as_str(), "cloud");
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn stub_activator_unavailable_and_ok() {
         let a = activator();
