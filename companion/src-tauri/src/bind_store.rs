@@ -83,10 +83,11 @@ impl BindStore {
         Self::default()
     }
 
-    /// Set the macOS dictation trigger (U1 scaffold; U3 implements).
+    /// Set the macOS dictation trigger by wire name. A blank value clears it
+    /// (back to the default, omitted from the file); any other value is stored
+    /// canonicalised, so an unknown name becomes `edit-menu`.
     pub fn set_mac_dictation_trigger(&mut self, t: &str) {
-        let _ = t;
-        todo!("U3")
+        self.mac_dictation_trigger = canonical_dictation_trigger(t);
     }
 
     /// Ensure both vectors are exactly `SLOT_COUNT` long and all values are
@@ -121,6 +122,7 @@ impl BindStore {
             *session = normalize_session_id(session).unwrap_or_default();
         }
         self.pinned_session = normalize_session_id(&self.pinned_session).unwrap_or_default();
+        self.mac_dictation_trigger = canonical_dictation_trigger(&self.mac_dictation_trigger);
     }
 
     /// Read the chat number for slot `n` (1-based). Returns `None` for an
@@ -217,6 +219,16 @@ impl BindStore {
         }
         let body = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))
+    }
+}
+
+/// Canonical wire name of a persisted dictation trigger; blank stays blank so
+/// files without the key re-save without it.
+fn canonical_dictation_trigger(t: &str) -> String {
+    if t.trim().is_empty() {
+        String::new()
+    } else {
+        crate::pc_asr::DictationTrigger::parse(t).as_str().to_string()
     }
 }
 
@@ -400,5 +412,43 @@ mod tests {
         assert_eq!(s.aliases, vec!["", "", ""]);
         assert_eq!(s.sessions, vec!["", "", ""]);
         assert_eq!(s.pinned_session, "");
+    }
+
+    // ── macOS dictation trigger ──────────────────────────────
+
+    #[test]
+    fn legacy_file_without_trigger_loads_empty_and_resaves_without_key() {
+        let legacy = r#"{"chats":[4,0,8],"aliases":["Plan","",""],"sessions":["dashboard:chat-4","",""],"pinned_session":"dashboard:chat-4"}"#;
+        let mut s: BindStore = serde_json::from_str(legacy).unwrap();
+        s.normalize();
+        assert_eq!(s.mac_dictation_trigger, "");
+        assert_eq!(serde_json::to_string(&s).unwrap(), legacy);
+        assert!(!serde_json::to_string_pretty(&BindStore::new())
+            .unwrap()
+            .contains("mac_dictation_trigger"));
+    }
+
+    #[test]
+    fn dictation_trigger_roundtrips_and_normalizes() {
+        let mut s = BindStore::new();
+        s.set_mac_dictation_trigger("double-control");
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""mac_dictation_trigger":"double-control""#));
+        let back: BindStore = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+
+        let mut upper: BindStore =
+            serde_json::from_str(r#"{"mac_dictation_trigger":"DOUBLE-CONTROL"}"#).unwrap();
+        upper.normalize();
+        assert_eq!(upper.mac_dictation_trigger, "double-control");
+
+        let mut junk: BindStore =
+            serde_json::from_str(r#"{"mac_dictation_trigger":"fn-fn"}"#).unwrap();
+        junk.normalize();
+        assert_eq!(junk.mac_dictation_trigger, "edit-menu");
+
+        s.set_mac_dictation_trigger("  ");
+        assert_eq!(s.mac_dictation_trigger, "");
+        assert!(!serde_json::to_string(&s).unwrap().contains("mac_dictation_trigger"));
     }
 }

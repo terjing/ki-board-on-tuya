@@ -8,6 +8,11 @@
 //! WinRT session is a documented follow-up. On non-Windows hosts a stub
 //! implements the same trait and logs that recognition is unsupported.
 //!
+//! macOS has no WinRT recognizer: it keeps using the stub below (the gate is
+//! unchanged). macOS dictation is driven by `pc_asr::activator`, which presses
+//! the Edit ▸ Start Dictation menu item or posts a double-tap modifier, and lets
+//! the OS type the recognized text into the focused window.
+//!
 //! The trait is what the rest of the app depends on, so swapping in the real
 //! WinRT recognizer later is a drop-in change with no call-site churn.
 
